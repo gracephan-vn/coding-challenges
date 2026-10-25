@@ -4,6 +4,29 @@ defmodule RideDispatch.LocationTest do
   alias RideDispatch.Location
 
   describe "distance_km/2" do
+    test "returns an error for invalid coordinates in either argument" do
+      valid = %{latitude: 10.7769, longitude: 106.7009}
+
+      for invalid <- [
+            %{latitude: 91, longitude: 0},
+            %{latitude: -91, longitude: 0},
+            %{latitude: 0, longitude: 181},
+            %{latitude: 0, longitude: -181},
+            %{latitude: "10", longitude: 0},
+            %{latitude: 0, longitude: :infinity},
+            %{latitude: :nan, longitude: 0},
+            %{latitude: 0},
+            %{longitude: 0},
+            %{},
+            nil,
+            []
+          ] do
+        assert Location.distance_km(invalid, valid) == {:error, :invalid_coordinates}
+        assert Location.distance_km(valid, invalid) == {:error, :invalid_coordinates}
+        assert Location.distance_km(invalid, invalid) == {:error, :invalid_coordinates}
+      end
+    end
+
     test "identical coordinates have zero distance" do
       location = %{latitude: 10.7769, longitude: 106.7009}
       assert_in_delta Location.distance_km(location, location), 0.0, 1.0e-9
