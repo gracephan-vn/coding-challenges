@@ -3,7 +3,14 @@ defmodule RideDispatch.Drivers.StateMachine do
     {:offline, :enable_availability} => :available,
     {:available, :disable_availability} => :offline,
     {:available, :enable_availability} => :available,
-    {:offline, :disable_availability} => :offline
+    {:offline, :disable_availability} => :offline,
+    {:available, :reserve_for_offer} => :offered,
+    {:offered, :accept_offer} => :busy,
+    {:offered, :reject_offer} => :available,
+    {:offered, :expire_offer} => :available,
+    {:offered, :cancel_offer} => :available,
+    {:busy, :complete_ride} => :available,
+    {:busy, :cancel_accepted_ride} => :available
   }
 
   def transition(%{status: status} = driver, action) do
