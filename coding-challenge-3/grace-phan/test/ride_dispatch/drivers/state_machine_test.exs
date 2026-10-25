@@ -59,6 +59,37 @@ defmodule RideDispatch.Drivers.StateMachineTest do
     end
   end
 
+  test "missing, unknown, and malformed current states return invalid_state" do
+    for invalid <- [
+          nil,
+          [],
+          :available,
+          %{},
+          %{status: nil},
+          %{status: :unknown},
+          %{status: "AVAILABLE"},
+          %{status: 1}
+        ],
+        action <- [:enable_availability, :accept_offer, :unknown] do
+      assert StateMachine.transition(invalid, action) == {:error, :invalid_state}
+    end
+  end
+
+  test "unsupported actions return invalid_transition for every valid state" do
+    for status <- [:offline, :available, :offered, :busy],
+        action <- [:unknown, nil, "enable_availability", {:set_status, :available}] do
+      assert StateMachine.transition(driver(status), action) == {:error, :invalid_transition}
+    end
+  end
+
+  test "only state is examined; offer and driver record validation belong to Store" do
+    assert StateMachine.transition(%{status: :offered}, :accept_offer) == {:ok, %{status: :busy}}
+    original = %{status: :busy, latitude: :not_validated, offer_id: "unverified"}
+
+    assert StateMachine.transition(original, :cancel_accepted_ride) ==
+             {:ok, %{original | status: :available}}
+  end
+
   defp driver(status) do
     %{
       id: "D001",
