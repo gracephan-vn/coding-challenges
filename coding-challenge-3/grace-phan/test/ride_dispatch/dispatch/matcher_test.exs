@@ -85,6 +85,61 @@ defmodule RideDispatch.Dispatch.MatcherTest do
     assert first.status == :available
   end
 
+  test "rejects invalid pickups even without candidates" do
+    for pickup <- [
+          nil,
+          %{},
+          %{latitude: 0},
+          %{latitude: 91, longitude: 0},
+          %{latitude: 0, longitude: -181},
+          %{latitude: "0", longitude: 0}
+        ] do
+      assert Matcher.nearest(pickup, []) == {:error, :invalid_pickup}
+      assert Matcher.nearest(pickup, [driver("D001", 0.0)]) == {:error, :invalid_pickup}
+    end
+  end
+
+  test "never selects drivers with missing or invalid coordinates" do
+    valid = driver("D100", 0.01)
+
+    for invalid <- [
+          Map.delete(driver("D001", 0.0), :latitude),
+          Map.delete(driver("D001", 0.0), :longitude),
+          %{driver("D001", 0.0) | latitude: -91},
+          %{driver("D001", 0.0) | longitude: 181},
+          %{driver("D001", 0.0) | latitude: nil},
+          %{driver("D001", 0.0) | longitude: :infinity}
+        ] do
+      assert Matcher.nearest(@pickup, [invalid]) == :none
+      assert Matcher.nearest(@pickup, [invalid, valid]) == {:ok, valid}
+    end
+  end
+
+  test "skips malformed drivers and unsupported statuses" do
+    valid = driver("D100", 0.01)
+
+    invalid = [
+      nil,
+      %{},
+      Map.delete(driver("D001", 0.0), :id),
+      %{driver("D001", 0.0) | id: 1},
+      Map.delete(driver("D001", 0.0), :status),
+      %{driver("D001", 0.0) | status: :unknown}
+    ]
+
+    assert Matcher.nearest(@pickup, invalid) == :none
+    assert Matcher.nearest(@pickup, invalid ++ [valid]) == {:ok, valid}
+  end
+
+  test "rejects invalid radius configuration" do
+    for radius <- [-1, "2", nil, :infinity] do
+      assert Matcher.nearest(@pickup, [], radius_km: radius) == {:error, :invalid_radius}
+
+      assert Matcher.nearest(@pickup, [driver("D001", 0.0)], radius_km: radius) ==
+               {:error, :invalid_radius}
+    end
+  end
+
   defp driver(id, longitude) do
     %{id: id, status: :available, latitude: 0.0, longitude: longitude}
   end
