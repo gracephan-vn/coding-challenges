@@ -5,4 +5,6 @@ defmodule RideDispatch.Location do
   end
 
   def valid?(_location), do: false
+
+  def distance_km(_from, _to), do: 0.0
 end
