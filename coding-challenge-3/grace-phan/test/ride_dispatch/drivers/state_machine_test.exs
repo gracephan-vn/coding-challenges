@@ -37,6 +37,28 @@ defmodule RideDispatch.Drivers.StateMachineTest do
     assert StateMachine.transition(driver(:available), :offline) == {:error, :invalid_transition}
   end
 
+  for {action, source, target} <- [
+        {:reserve_for_offer, :available, :offered},
+        {:accept_offer, :offered, :busy},
+        {:reject_offer, :offered, :available},
+        {:expire_offer, :offered, :available},
+        {:cancel_offer, :offered, :available},
+        {:complete_ride, :busy, :available},
+        {:cancel_accepted_ride, :busy, :available}
+      ] do
+    test "#{action} permits only #{source} -> #{target}, preserving other fields" do
+      original = driver(unquote(source))
+
+      assert StateMachine.transition(original, unquote(action)) ==
+               {:ok, %{original | status: unquote(target)}}
+
+      for invalid_source <- [:offline, :available, :offered, :busy] -- [unquote(source)] do
+        assert StateMachine.transition(driver(invalid_source), unquote(action)) ==
+                 {:error, :invalid_transition}
+      end
+    end
+  end
+
   defp driver(status) do
     %{
       id: "D001",
