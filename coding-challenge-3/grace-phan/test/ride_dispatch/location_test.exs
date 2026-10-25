@@ -8,6 +8,52 @@ defmodule RideDispatch.LocationTest do
       location = %{latitude: 10.7769, longitude: 106.7009}
       assert_in_delta Location.distance_km(location, location), 0.0, 1.0e-9
     end
+
+    test "calculates a short equatorial distance in kilometers" do
+      from = %{latitude: 0, longitude: 0}
+      to = %{latitude: 0, longitude: 0.01}
+      assert_in_delta Location.distance_km(from, to), 1.1119493, 1.0e-6
+    end
+
+    test "accounts for latitude when calculating a great-circle distance" do
+      # These points subtend 60 degrees at the center of a spherical Earth.
+      from = %{latitude: 45, longitude: 0}
+      to = %{latitude: 45, longitude: 90}
+      assert_in_delta Location.distance_km(from, to), 6671.6956, 0.001
+    end
+
+    test "is symmetric and non-negative for southern and western coordinates" do
+      from = %{latitude: -33.8688, longitude: 151.2093}
+      to = %{latitude: 40.7128, longitude: -74.0060}
+      forward = Location.distance_km(from, to)
+      reverse = Location.distance_km(to, from)
+
+      assert forward > 0
+      assert reverse >= 0
+      assert_in_delta forward, reverse, 1.0e-8
+    end
+
+    test "supports poles and antipodal points" do
+      for {from, to} <- [
+            {%{latitude: -90, longitude: -180}, %{latitude: 90, longitude: 180}},
+            {%{latitude: 36.12, longitude: -86.67}, %{latitude: -36.12, longitude: 93.33}}
+          ] do
+        assert_in_delta Location.distance_km(from, to), 20015.0868, 0.001
+      end
+    end
+
+    test "uses the short distance across the antimeridian" do
+      from = %{latitude: 0, longitude: 179.99}
+      to = %{latitude: 0, longitude: -179.99}
+      assert_in_delta Location.distance_km(from, to), 2.2238985, 1.0e-6
+
+      assert_in_delta Location.distance_km(
+                        %{latitude: 0, longitude: -180},
+                        %{latitude: 0, longitude: 180}
+                      ),
+                      0.0,
+                      1.0e-9
+    end
   end
 
   test "rejects latitude greater than 90" do
