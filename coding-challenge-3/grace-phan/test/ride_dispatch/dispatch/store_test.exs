@@ -38,6 +38,42 @@ defmodule RideDispatch.Dispatch.StoreTest do
     assert Store.list_available_drivers(StateServer) == []
   end
 
+  test "rejects duplicate seed IDs instead of overwriting a record" do
+    original = driver("D001")
+    duplicate = %{original | longitude: 100.0}
+
+    assert StateServer.start_link(drivers: [original, duplicate]) ==
+             {:error, {:duplicate_driver_id, "D001"}}
+  end
+
+  test "rejects malformed driver seeds and states requiring an active ride" do
+    original = driver("D001")
+
+    for invalid <- [
+          %{original | status: :busy},
+          %{original | status: :offered},
+          %{original | status: :unknown},
+          %{original | id: ""},
+          %{original | id: 1},
+          %{original | latitude: 91},
+          %{original | longitude: -181},
+          %{original | latitude: "10"},
+          Map.delete(original, :id),
+          Map.delete(original, :status),
+          Map.delete(original, :latitude),
+          Map.delete(original, :longitude),
+          nil
+        ] do
+      assert StateServer.start_link(drivers: [invalid]) == {:error, :invalid_driver_seed}
+    end
+  end
+
+  test "rejects non-list seed collections" do
+    for seeds <- [nil, %{}, "drivers"] do
+      assert StateServer.start_link(drivers: seeds) == {:error, :invalid_driver_seeds}
+    end
+  end
+
   defp start_store(drivers) do
     start_supervised!(Supervisor.child_spec({StateServer, drivers: drivers}, id: make_ref()))
   end
