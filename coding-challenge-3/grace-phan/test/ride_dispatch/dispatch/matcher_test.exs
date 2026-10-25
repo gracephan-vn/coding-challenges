@@ -61,6 +61,30 @@ defmodule RideDispatch.Dispatch.MatcherTest do
     assert Matcher.nearest(@pickup, [first, second]) == {:ok, first}
   end
 
+  test "excludes rejected and timed-out driver IDs for this ride" do
+    rejected = driver("D001", 0.001)
+    timed_out = driver("D002", 0.002)
+    next = driver("D003", 0.003)
+    drivers = [rejected, timed_out, next]
+    opts = [excluded_driver_ids: [rejected.id, timed_out.id]]
+
+    assert Matcher.nearest(@pickup, drivers, opts) == {:ok, next}
+    assert Matcher.nearest(@pickup, [rejected, timed_out], opts) == :none
+    assert Matcher.nearest(@pickup, drivers, opts) == {:ok, next}
+  end
+
+  test "exclusions do not leak to another ride or mutate drivers" do
+    first = driver("D001", 0.001)
+    second = driver("D002", 0.002)
+    drivers = [first, second]
+    original = :erlang.term_to_binary(drivers)
+
+    assert Matcher.nearest(@pickup, drivers, excluded_driver_ids: [first.id]) == {:ok, second}
+    assert Matcher.nearest(@pickup, drivers) == {:ok, first}
+    assert :erlang.term_to_binary(drivers) == original
+    assert first.status == :available
+  end
+
   defp driver(id, longitude) do
     %{id: id, status: :available, latitude: 0.0, longitude: longitude}
   end
