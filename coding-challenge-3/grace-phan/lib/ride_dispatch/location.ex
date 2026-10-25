@@ -8,7 +8,20 @@ defmodule RideDispatch.Location do
 
   def valid?(_location), do: false
 
+  @doc """
+  Returns the spherical great-circle distance in kilometers, using a 6,371 km Earth radius.
+
+  Returns `{:error, :invalid_coordinates}` if either coordinate map is invalid.
+  """
   def distance_km(from, to) do
+    if valid?(from) and valid?(to) do
+      haversine_km(from, to)
+    else
+      {:error, :invalid_coordinates}
+    end
+  end
+
+  defp haversine_km(from, to) do
     latitude_from = radians(from.latitude)
     latitude_to = radians(to.latitude)
     latitude_delta = latitude_to - latitude_from
