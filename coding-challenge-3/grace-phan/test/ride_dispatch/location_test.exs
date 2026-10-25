@@ -3,6 +3,13 @@ defmodule RideDispatch.LocationTest do
 
   alias RideDispatch.Location
 
+  describe "distance_km/2" do
+    test "identical coordinates have zero distance" do
+      location = %{latitude: 10.7769, longitude: 106.7009}
+      assert_in_delta Location.distance_km(location, location), 0.0, 1.0e-9
+    end
+  end
+
   test "rejects latitude greater than 90" do
     assert Location.valid?(%{latitude: 91.0, longitude: 106.7009}) == false
   end
