@@ -78,6 +78,133 @@ defmodule RideDispatch.Dispatch.StoreTest do
     end
   end
 
+  test "updates both coordinates while preserving status and unrelated fields" do
+    original = %{driver("D001") | status: :offline}
+    server = start_store([original])
+    location = %{latitude: -90, longitude: 180, status: :available, label: "ignored"}
+    expected = %{original | latitude: -90, longitude: 180}
+
+    assert Store.update_driver_location(server, original.id, location) == {:ok, expected}
+    assert Store.get_driver(server, original.id) == {:ok, expected}
+    assert Store.list_available_drivers(server) == []
+  end
+
+  test "invalid location commands leave state unchanged" do
+    original = driver("D001")
+    server = start_store([original])
+
+    for location <- [
+          nil,
+          %{},
+          %{latitude: 0},
+          %{longitude: 0},
+          %{latitude: 91, longitude: 0},
+          %{latitude: 0, longitude: -181},
+          %{latitude: "0", longitude: 0},
+          %{latitude: 0, longitude: :infinity}
+        ] do
+      assert Store.update_driver_location(server, original.id, location) ==
+               {:error, :invalid_coordinates}
+
+      assert Store.get_driver(server, original.id) == {:ok, original}
+    end
+  end
+
+  test "updating an unknown driver returns not_found without creating it" do
+    server = start_store([])
+
+    assert Store.update_driver_location(server, "missing", %{latitude: 0, longitude: 0}) ==
+             :not_found
+
+    assert Store.get_driver(server, "missing") == :not_found
+    assert Store.list_available_drivers(server) == []
+  end
+
+  test "updates remain isolated between owners and returned values" do
+    original = driver("D001")
+    first = start_store([original])
+    second = start_store([original])
+
+    assert {:ok, updated} =
+             Store.update_driver_location(first, original.id, %{latitude: 1, longitude: 2})
+
+    changed = %{updated | latitude: 3}
+
+    assert changed != updated
+    assert Store.get_driver(first, original.id) == {:ok, updated}
+    assert Store.get_driver(second, original.id) == {:ok, original}
+  end
+
+  test "competing callers preserve updates to different drivers on the same owner" do
+    first = driver("D001")
+    second = driver("D002")
+    server = start_store([first, second])
+    first_location = %{latitude: 1, longitude: 2}
+    second_location = %{latitude: 3, longitude: 4}
+
+    results =
+      compete([
+        fn -> Store.update_driver_location(server, first.id, first_location) end,
+        fn -> Store.update_driver_location(server, second.id, second_location) end
+      ])
+
+    expected_first = Map.merge(first, first_location)
+    expected_second = Map.merge(second, second_location)
+    assert results == [{:ok, expected_first}, {:ok, expected_second}]
+    assert Store.get_driver(server, first.id) == {:ok, expected_first}
+    assert Store.get_driver(server, second.id) == {:ok, expected_second}
+  end
+
+  test "competing updates and reads never expose mixed coordinate pairs" do
+    original = driver("D001")
+    server = start_store([original])
+    locations = [%{latitude: 1, longitude: 2}, %{latitude: 3, longitude: 4}]
+    expected = Enum.map(locations, &Map.merge(original, &1))
+
+    observations =
+      compete(
+        for location <- locations do
+          fn ->
+            for _ <- 1..25 do
+              assert Store.update_driver_location(server, original.id, location) ==
+                       {:ok, Map.merge(original, location)}
+
+              assert {:ok, observed} = Store.get_driver(server, original.id)
+              observed
+            end
+          end
+        end
+      )
+
+    assert Enum.all?(List.flatten(observations), &(&1 in expected))
+    assert {:ok, final} = Store.get_driver(server, original.id)
+    assert final in expected
+  end
+
+  defp compete(functions) do
+    parent = self()
+    gate = make_ref()
+
+    tasks =
+      Enum.map(functions, fn function ->
+        Task.async(fn ->
+          send(parent, {:ready, gate, self()})
+
+          receive do
+            {:go, ^gate} -> function.()
+          end
+        end)
+      end)
+
+    for task <- tasks do
+      pid = task.pid
+      assert_receive {:ready, ^gate, ^pid}, 1000
+    end
+
+    Enum.each(tasks, &send(&1.pid, {:go, gate}))
+    Enum.map(tasks, &Task.await/1)
+  end
+
   defp start_store(drivers) do
     start_supervised!(Supervisor.child_spec({StateServer, drivers: drivers}, id: make_ref()))
   end
