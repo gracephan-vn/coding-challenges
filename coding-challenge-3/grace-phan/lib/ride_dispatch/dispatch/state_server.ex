@@ -37,6 +37,22 @@ defmodule RideDispatch.Dispatch.StateServer do
     {:reply, drivers, state}
   end
 
+  def handle_call({:update_driver_location, id, location}, _from, state) do
+    case Map.fetch(state.drivers, id) do
+      :error ->
+        {:reply, :not_found, state}
+
+      {:ok, driver} ->
+        if Location.valid?(location) do
+          updated = %{driver | latitude: location.latitude, longitude: location.longitude}
+          new_state = %{state | drivers: Map.put(state.drivers, id, updated)}
+          {:reply, {:ok, updated}, new_state}
+        else
+          {:reply, {:error, :invalid_coordinates}, state}
+        end
+    end
+  end
+
   defp seed_drivers(seeds) when is_list(seeds) do
     Enum.reduce_while(seeds, {:ok, %{}}, fn driver, {:ok, drivers} ->
       cond do
