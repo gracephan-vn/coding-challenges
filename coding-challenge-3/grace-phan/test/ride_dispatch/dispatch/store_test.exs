@@ -39,6 +39,7 @@ defmodule RideDispatch.Dispatch.StoreTest do
   end
 
   test "rejects duplicate seed IDs instead of overwriting a record" do
+    Process.flag(:trap_exit, true)
     original = driver("D001")
     duplicate = %{original | longitude: 100.0}
 
@@ -47,6 +48,7 @@ defmodule RideDispatch.Dispatch.StoreTest do
   end
 
   test "rejects malformed driver seeds and states requiring an active ride" do
+    Process.flag(:trap_exit, true)
     original = driver("D001")
 
     for invalid <- [
@@ -69,6 +71,8 @@ defmodule RideDispatch.Dispatch.StoreTest do
   end
 
   test "rejects non-list seed collections" do
+    Process.flag(:trap_exit, true)
+
     for seeds <- [nil, %{}, "drivers"] do
       assert StateServer.start_link(drivers: seeds) == {:error, :invalid_driver_seeds}
     end
