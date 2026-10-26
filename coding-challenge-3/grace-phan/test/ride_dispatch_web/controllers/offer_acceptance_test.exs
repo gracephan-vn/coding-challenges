@@ -151,6 +151,31 @@ defmodule RideDispatchWeb.OfferAcceptanceTest do
       |> put_private(:dispatch_store, server)
       |> put_req_header("accept", "application/json")
 
+  test "unparsed nonempty request bodies cannot be mistaken for an empty command", c do
+    before = :sys.get_state(c.server)
+
+    for media_type <- ["text/plain", "application/octet-stream"] do
+      conn = connection(c.server)
+      conn = if media_type, do: put_req_header(conn, "content-type", media_type), else: conn
+
+      assert post(conn, accept_path(c.ride.id, "D001"), "unsupported=1") |> json_response(400) ==
+               error("Bad Request")
+
+      assert :sys.get_state(c.server) == before
+    end
+
+    # ConnTest.post requires Content-Type for binary bodies; use the real Endpoint
+    # directly to cover a body without that header as well.
+    response =
+      Plug.Test.conn(:post, accept_path(c.ride.id, "D001"), "unsupported=1")
+      |> put_private(:dispatch_store, c.server)
+      |> put_req_header("accept", "application/json")
+      |> RideDispatchWeb.Endpoint.call(RideDispatchWeb.Endpoint.init([]))
+
+    assert json_response(response, 400) == error("Bad Request")
+    assert :sys.get_state(c.server) == before
+  end
+
   defp accept_path(ride, driver), do: "/rides/#{ride}/offers/#{driver}/accept"
   defp request(server, ride, driver), do: post(connection(server), accept_path(ride, driver))
 

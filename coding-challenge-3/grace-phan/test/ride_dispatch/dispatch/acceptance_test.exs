@@ -456,4 +456,45 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
       assert final.pending_events[event.eventId].outcome == :no_candidate
     end
   end
+
+  test "synthetic malformed receipt status and Ride state return controlled invariant failures" do
+    {server, ride, offer, _} = reserved()
+    assert {:ok, _} = Store.accept_offer(server, ride.id, "D001")
+    state = :sys.get_state(server)
+
+    for input <- [
+          update_in(state.offers[offer.id], &Map.delete(&1, :status)),
+          update_in(state.rides[ride.id], &Map.delete(&1, :status))
+        ] do
+      {_, result, final} = StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+      assert result == {:error, :inconsistent_ownership}
+      assert final == input
+    end
+  end
+
+  test "synthetic successful history for another Driver cannot support a second Ride acceptance" do
+    {server, ride, offer, _} = reserved()
+    state = :sys.get_state(server)
+
+    other_result =
+      Map.merge(state.rides[ride.id], %{
+        status: :driver_accepted,
+        assignedDriverId: "D002",
+        currentOfferId: "older"
+      })
+
+    older =
+      Map.merge(offer, %{
+        id: "older",
+        driverId: "D002",
+        status: :completed,
+        accepted_at_ms: 0,
+        acceptance_result: other_result
+      })
+
+    input = put_in(state.offers[older.id], older)
+    {_, result, final} = StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+    assert result == {:error, :inconsistent_ownership}
+    assert final == input
+  end
 end
