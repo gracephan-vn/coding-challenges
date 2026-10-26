@@ -201,4 +201,61 @@ defmodule RideDispatchWeb.OfferAcceptanceTest do
         "assignedDriverId" => driver
       }
     }
+
+  test "concurrent HTTP acceptance requests return the same original result", c do
+    parent = self()
+
+    tasks =
+      for _ <- 1..5 do
+        Task.async(fn ->
+          send(parent, {:ready, self()})
+
+          receive do
+            :go -> request(c.server, c.ride.id, "D001") |> json_response(200)
+          end
+        end)
+      end
+
+    for task <- tasks, do: assert_receive({:ready, pid} when pid == task.pid)
+    for task <- tasks, do: send(task.pid, :go)
+    assert [result] = tasks |> Enum.map(&Task.await/1) |> Enum.uniq()
+    assert result == public_ride(c.ride, "DRIVER_ACCEPTED", "D001")
+    assert [offer] = Store.list_offers(c.server)
+    assert offer.id == c.offer.id and offer.status == :accepted and offer.accepted_at_ms == 0
+    assert {:ok, %{status: :busy}} = Store.get_driver(c.server, "D001")
+    assert length(Store.list_events(c.server)) == 2
+  end
+
+  test "mapping-only protocol fixture sanitizes ambiguous stale and invariant errors", c do
+    for {reason, status, detail} <- [
+          {:ambiguous_offer, 409, "Conflict"},
+          {:invalid_transition, 409, "Conflict"},
+          {:inconsistent_ownership, 500, "Internal Server Error"},
+          {:invalid_request, 400, "Bad Request"}
+        ] do
+      fixture =
+        start_supervised!(
+          Supervisor.child_spec({__MODULE__.ErrorReply, {reason, self()}}, id: make_ref())
+        )
+
+      assert request(fixture, c.ride.id, "D001") |> json_response(status) == error(detail)
+      assert_receive {:acceptance_called, ride_id, "D001"}
+      assert ride_id == c.ride.id
+    end
+
+    # This fixture verifies response mapping only. Real invariant validation is
+    # exercised separately by the actual StateServer callback tests.
+    assert {:ok, %{status: :pending}} = Store.get_offer(c.server, c.offer.id)
+  end
+
+  defmodule ErrorReply do
+    use GenServer
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+    def init(opts), do: {:ok, opts}
+
+    def handle_call({:accept_offer, ride, driver}, _from, {reason, parent} = state) do
+      send(parent, {:acceptance_called, ride, driver})
+      {:reply, {:error, reason}, state}
+    end
+  end
 end
