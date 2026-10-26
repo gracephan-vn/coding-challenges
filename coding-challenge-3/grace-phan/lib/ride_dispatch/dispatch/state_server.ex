@@ -41,6 +41,30 @@ defmodule RideDispatch.Dispatch.StateServer do
   end
 
   @impl true
+  def handle_call({:accept_offer, ride_id, driver_id}, _from, state) do
+    ride = state.rides[ride_id]
+    driver = state.drivers[driver_id]
+    offer = state.offers[ride.currentOfferId]
+
+    with {:ok, now} <- read_clock(state.clock),
+         {:ok, accepted} <- RideStateMachine.transition(ride, :accept_offer),
+         {:ok, busy} <- StateMachine.transition(driver, :accept_offer) do
+      receipt =
+        Map.merge(offer, %{status: :accepted, accepted_at_ms: now, acceptance_result: accepted})
+
+      updated = %{
+        state
+        | rides: Map.put(state.rides, ride_id, accepted),
+          drivers: Map.put(state.drivers, driver_id, busy),
+          offers: Map.put(state.offers, offer.id, receipt)
+      }
+
+      {:reply, {:ok, accepted}, updated}
+    else
+      {:error, _reason} = error -> {:reply, error, state}
+    end
+  end
+
   def handle_call(:list_offers, _from, state) do
     {:reply, state.offers |> Map.values() |> Enum.sort_by(& &1.id), state}
   end

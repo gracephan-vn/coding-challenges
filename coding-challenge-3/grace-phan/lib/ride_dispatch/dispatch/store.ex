@@ -32,6 +32,10 @@ defmodule RideDispatch.Dispatch.Store do
   def list_available_drivers(server), do: GenServer.call(server, :list_available_drivers)
 
   # Commands
+  @doc "Accept the exact current Offer atomically; return the original accepted Ride."
+  def accept_offer(server, ride_id, driver_id),
+    do: GenServer.call(server, {:accept_offer, ride_id, driver_id})
+
   @doc "Subscribe the calling dispatcher to nonauthoritative wake-up hints."
   def subscribe_events(server), do: GenServer.call(server, :subscribe_events)
 
