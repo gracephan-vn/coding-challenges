@@ -2,7 +2,7 @@ defmodule RideDispatch.Dispatch.EventDispatcher do
   @moduledoc """
   One supervised asynchronous consumer. Store owns every business mutation.
   Notifications are hints; startup and bounded recovery scans find missed work.
-  Only RideCreated is actionable. DispatchRequested remains pending for 10B.
+  RideCreated and DispatchRequested are actionable; other event types stay pending.
 
   `store` accepts a PID or registered name. `scan_interval_ms` defaults to 1000.
   Tests may supply a processing function (outside the state owner) and disable

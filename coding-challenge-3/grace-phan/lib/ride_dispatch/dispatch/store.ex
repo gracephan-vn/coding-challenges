@@ -36,7 +36,10 @@ defmodule RideDispatch.Dispatch.Store do
   def subscribe_events(server), do: GenServer.call(server, :subscribe_events)
 
   @doc """
-  Atomically apply RideCreated, acknowledge it and enqueue DispatchRequested.
+  Atomically process and acknowledge RideCreated or DispatchRequested. RideCreated
+  starts matching and enqueues DispatchRequested. DispatchRequested uses current
+  authoritative state to reserve one pending Offer or record a no-candidate result.
+  Reservation coordinates Ride, Driver, Offer and Event; it does not accept a ride.
   Returns `{:ok, :processed | :already_processed | :ignored}`, `:not_found`,
   or `{:error, :unsupported_event | :failed | {:retry_at, time} | {:permanent, reason}}`.
   Unsupported work is never consumed. Duplicate commands leave state unchanged.

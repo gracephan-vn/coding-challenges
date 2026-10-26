@@ -193,7 +193,7 @@ defmodule RideDispatch.Dispatch.StateServer do
 
       {:ok, event} ->
         cond do
-          not processable_pending?(event) ->
+          not supported_pending?(event) ->
             {:reply, {:error, :unsupported_event}, state}
 
           not valid_event?(event, id) ->
@@ -229,7 +229,7 @@ defmodule RideDispatch.Dispatch.StateServer do
 
         {:ok, event} ->
           cond do
-            not processable_pending?(event) ->
+            not supported_pending?(event) ->
               {:reply, {:error, :not_actionable}, state}
 
             Map.get(event, :attempts, 0) != version ->
@@ -451,9 +451,7 @@ defmodule RideDispatch.Dispatch.StateServer do
   defp put_event(state, event),
     do: %{state | pending_events: Map.put(state.pending_events, event.eventId, event)}
 
-  defp supported_pending?(event), do: event.type == :ride_created and event.status == :pending
-
-  defp processable_pending?(event),
+  defp supported_pending?(event),
     do: event.type in [:ride_created, :dispatch_requested] and event.status == :pending
 
   defp valid_event?(%{eventId: id, rideId: ride_id}, id),

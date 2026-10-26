@@ -61,7 +61,7 @@ defmodule RideDispatch.Dispatch.EventStoreTest do
     unsupported = %{
       eventId: "aaa",
       rideId: "missing",
-      type: :dispatch_requested,
+      type: :future_event,
       status: :pending
     }
 
@@ -159,7 +159,7 @@ defmodule RideDispatch.Dispatch.EventStoreTest do
     end
   end
 
-  test "competing processing calls have one side effect and preserve unsupported successor" do
+  test "competing RideCreated calls emit one discoverable pending successor" do
     server = start_supervised!({StateServer, passengers: [%{id: "P001"}]})
 
     body = %{
@@ -189,7 +189,7 @@ defmodule RideDispatch.Dispatch.EventStoreTest do
     assert Enum.count(results, &(&1 == {:ok, :processed})) == 1
     assert Enum.count(results, &(&1 == {:ok, :already_processed})) == 9
     assert {:ok, %{status: :matching}} = Store.get_ride(server, ride.id)
-    assert Store.list_actionable_events(server) == []
+    assert [%{type: :dispatch_requested, status: :pending}] = Store.list_actionable_events(server)
     events = Store.list_events(server)
     assert length(events) == 2
     assert Enum.count(events, &(&1.type == :dispatch_requested and &1.status == :pending)) == 1

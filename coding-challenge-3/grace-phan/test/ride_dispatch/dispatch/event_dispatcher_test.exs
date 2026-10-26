@@ -62,15 +62,17 @@ defmodule RideDispatch.Dispatch.EventDispatcherTest do
     assert :sys.get_state(EventDispatcher).store == StateServer
   end
 
-  test "startup consumes pending work independently of HTTP, preserves original replay and pending handoff",
+  test "startup consumes both event types independently of HTTP and preserves original replay",
        %{server: server} do
     {ride, id, body} = create(server)
     worker = dispatcher(server)
     assert_receive {:result, ^id, {:ok, :processed}, ^worker}, 1000
+    dispatch_id = "dispatch-" <> ride.id
+    assert_receive {:result, ^dispatch_id, {:ok, :processed}, ^worker}, 1000
     assert {:ok, %{status: :matching}} = Store.get_ride(server, ride.id)
     assert Store.create_ride(server, "key", body) == {:ok, ride}
 
-    assert [%{type: :dispatch_requested, status: :pending}] =
+    assert [%{type: :dispatch_requested, status: :processed, outcome: :no_candidate}] =
              Enum.filter(Store.list_events(server), &(&1.type == :dispatch_requested))
 
     EventDispatcher.wake(worker)
@@ -130,11 +132,17 @@ defmodule RideDispatch.Dispatch.EventDispatcherTest do
 
     process = fn owner, id ->
       result = Store.process_event(owner, id)
-      send(parent, {:committed, self(), result})
+      {:ok, event} = Store.get_event(owner, id)
 
-      receive do
-        :continue -> result
+      if event.type == :ride_created do
+        send(parent, {:committed, self(), result})
+
+        receive do
+          :continue -> :ok
+        end
       end
+
+      result
     end
 
     {_ride, id, _} = create(server)
