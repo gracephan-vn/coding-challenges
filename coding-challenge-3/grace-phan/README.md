@@ -64,18 +64,82 @@ domain result), and one pending event together. Event shape:
 No timestamp is required. Ride/Event IDs use distinct prefixes and a VM-wide
 unique counter; uniqueness is not promised across VM restarts. No external I/O,
 message publication, task spawning, or matching occurs in the creation callback.
-A pending event is neither delivered nor processed: AC-10 remains incomplete.
+Creation only records pending work. The supervised dispatcher now consumes RideCreated asynchronously as described below; Driver matching remains unimplemented and AC-10 incomplete.
 
 The original domain result is stored separately from current Ride state; HTTP
 serialization is not stored. GET reads current state, while POST replay reads the
-original creation result. There is no lifecycle integration yet, so replay after a
-real stored status transition is an explicitly deferred integration test.
+original creation result. The asynchronous HTTP integration test verifies GET becomes MATCHING while an identical POST retry retains the original REQUESTED creation result.
 
 State and idempotency are volatile. A caller timeout does not cancel a command:
 retrying with the same key is safe while the owner survives. After owner crash or
 restart, keys, Rides and events are lost; a retry can create a new Ride. This is
 not crash-durable idempotency or a durable transactional outbox. One mailbox
 serializes reads/writes, records grow without eviction, and there are no external
-side-effect transactions or multi-node guarantees. Acceptance/lifecycle
-idempotency, dispatch consumption, reservation and offer workflows remain future
-features. See [AC traceability](docs/ac-traceability.md) for evidence boundaries.
+side-effect transactions or multi-node guarantees. Acceptance and broader lifecycle idempotency, DispatchRequested consumption, reservation and offer workflows remain future features. See [AC traceability](docs/ac-traceability.md) for evidence boundaries.
+
+
+## Asynchronous event processing (Feature #10A)
+
+One supervised `Dispatch.EventDispatcher` starts after the named StateServer,
+independently of HTTP. Store operations accept an explicit PID/name for isolated
+tests. After a successful create call, the Store wrapper requests a wake-up hint;
+creation's atomic callback does not publish events or spawn tasks. Startup and
+one-second recovery scans cover missed notifications, including a lost creation
+reply. Hints coalesce; only due supported events are selected, one per dispatcher
+mailbox turn. A single replaceable timer schedules the next eligible retry or
+recovery scan. Unsupported events cannot cause an immediate rescan loop.
+
+`Store.process_event(server, event_id)` performs this complete transition within
+one callback:
+
+```text
+RideCreated PROCESSED + Ride MATCHING + one DispatchRequested PENDING
+```
+
+It reuses `Rides.StateMachine.transition/2`. The successor ID is deterministically
+`dispatch-{rideId}`, distinct from the Ride and original event. Repeating a
+processed event changes nothing; a distinct duplicate for an already-MATCHING
+Ride is acknowledged as ignored without another successor. Known later or
+terminal Ride states are also ignored without changing the Ride. Missing Rides
+or invalid Ride states produce a permanent failed event, without a retry.
+
+`DispatchRequested` has no handler in 10A: it remains pending, unchanged and
+visible through `Store.list_events/1` and `Store.get_event/2`. It is excluded from
+`list_actionable_events/1` and retry scheduling. Feature #10B must introduce its
+handler using the same atomic processing command, preserving these pending
+records rather than reopening acknowledged RideCreated events.
+
+There are no claims, leases, or separate acknowledgements. Event records remain
+in the authoritative `pending_events` map after processing/failure. Attempt count
+defaults to zero until first processing/failure; `next_attempt_at` uses monotonic
+milliseconds and defaults to immediate eligibility. Completed records carry an
+outcome; failed records carry a sanitized reason.
+
+Definite worker-side exceptions or retryable results use
+`Store.fail_event(server, id, observed_attempts, :processing_failed)`. StateServer
+checks the observed attempt version before accounting for failure, avoiding
+repeated failure reports consuming attempts. Three attempts total are allowed,
+with one-second then two-second backoff; exhaustion is retained as failed.
+Production processing calls Store directly; a startup processing-function option
+outside the owner allows deterministic fault injection in tests. No caller-supplied
+mutation callback is installed in StateServer.
+
+A Store timeout is uncertain, not a processing failure. The dispatcher rereads the
+event before retrying and never consumes a failure attempt for a timeout. A worker
+crash before processing leaves pending work for restart; a crash after commit
+finds the event already processed. When a registered owner is replaced, the
+dispatcher reconnects; the old owner's volatile work is lost. This mechanism
+provides duplicate-safe local transitions, not durable or exactly-once delivery.
+
+Tests use isolated owners/dispatchers, fake monotonic time, process barriers and
+telemetry message assertions without sleeps. Run:
+
+```sh
+mix test test/ride_dispatch/dispatch/event_store_test.exs test/ride_dispatch/dispatch/event_dispatcher_test.exs test/ride_dispatch_web/controllers/ride_controller_test.exs
+```
+
+AC-08 remains partial (Driver acceptance and broader lifecycle idempotency),
+AC-09 still requires reservation and two different competing Rides, and AC-10
+remains partial until asynchronous Driver matching and its failure/duplicate
+handling are implemented. Event scans and retained records still contend for
+one mailbox and grow in memory; no throughput or durable recovery is promised.
