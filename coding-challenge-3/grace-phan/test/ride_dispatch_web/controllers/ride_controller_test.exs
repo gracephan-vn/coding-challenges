@@ -195,6 +195,74 @@ defmodule RideDispatchWeb.RideControllerTest do
     assert Enum.count(Store.list_events(server), &(&1.type == :dispatch_requested)) == 1
   end
 
+  test "HTTP Driver updates feed asynchronous reservation and rejected availability preserves ownership" do
+    server =
+      start_supervised!(
+        Supervisor.child_spec(
+          {StateServer,
+           passengers: [%{id: "P001"}],
+           drivers: [
+             %{id: "D001", status: :available, latitude: 10.7769, longitude: 106.7009},
+             %{id: "D002", status: :offline, latitude: 10.777, longitude: 106.7009, label: "keep"}
+           ]},
+          id: :reservation_http
+        )
+      )
+
+    assert conn(server)
+           |> put("/drivers/D001/location", Jason.encode!(%{latitude: 0, longitude: 0}))
+           |> json_response(200)
+
+    assert conn(server)
+           |> put("/drivers/D002/availability", Jason.encode!(%{available: true}))
+           |> json_response(200)
+
+    parent = self()
+    handler = make_ref()
+
+    :telemetry.attach(
+      handler,
+      [:ride_dispatch, :event, :processed],
+      fn _, _, metadata, _ ->
+        if metadata.server == server and String.starts_with?(metadata.event_id, "dispatch-") do
+          send(parent, {:assigned, metadata.event_id, metadata.result})
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    start_supervised!({RideDispatch.Dispatch.EventDispatcher, store: server})
+    original = create(server, body()) |> json_response(201)
+    ride_id = original["data"]["rideId"]
+    assert_receive {:assigned, event_id, {:ok, :processed}}, 1000
+    assert event_id == "dispatch-" <> ride_id
+
+    expected =
+      original
+      |> put_in(["data", "status"], "DRIVER_ASSIGNED")
+      |> put_in(["data", "assignedDriverId"], "D002")
+
+    assert read(server, ride_id) |> json_response(200) == expected
+    assert create(server, body()) |> json_response(201) == original
+    assert {:ok, %{status: :offered, label: "keep"}} = Store.get_driver(server, "D002")
+    before = :sys.get_state(server)
+
+    for available <- [false, true] do
+      assert conn(server)
+             |> put("/drivers/D002/availability", Jason.encode!(%{available: available}))
+             |> json_response(409) == error("Conflict")
+    end
+
+    after_rejection = :sys.get_state(server)
+
+    assert Map.take(after_rejection, [:drivers, :rides, :offers, :pending_events]) ==
+             Map.take(before, [:drivers, :rides, :offers, :pending_events])
+
+    assert [offer] = Store.list_offers(server)
+    assert offer.driverId == "D002" and offer.rideId == ride_id and offer.status == :pending
+  end
+
   defp conn(server),
     do:
       build_conn()

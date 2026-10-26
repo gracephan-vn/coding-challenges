@@ -142,6 +142,148 @@ defmodule RideDispatch.Dispatch.ReservationDispatcherTest do
     assert map_size(state.pending_events) == 4
   end
 
+  test "dispatcher restart before reservation recovers pending supported work", %{server: server} do
+    {ride, event} = pending(server, "restart-before")
+    parent = self()
+
+    process = fn owner, id ->
+      send(parent, {:at_boundary, self(), id})
+
+      receive do
+        :continue -> Store.process_event(owner, id)
+      end
+    end
+
+    worker = dispatcher(server, process: process)
+    id = event.eventId
+    assert_receive {:at_boundary, ^worker, ^id}, 1000
+    monitor = Process.monitor(worker)
+    Process.exit(worker, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}
+    assert_receive {:at_boundary, restarted, ^id}, 1000
+    refute restarted == worker
+    assert {:ok, %{status: :pending}} = Store.get_event(server, id)
+    assert Store.list_offers(server) == []
+    send(restarted, :continue)
+    assert_receive {:result, ^id, {:ok, :processed}, ^restarted}, 1000
+    assert_assignment(server, ride.id)
+  end
+
+  test "dispatcher restart after reservation observes acknowledgement and cannot duplicate", %{
+    server: server
+  } do
+    {ride, event} = pending(server, "restart-after")
+    parent = self()
+
+    process = fn owner, id ->
+      result = Store.process_event(owner, id)
+      send(parent, {:committed, self(), id})
+
+      receive do
+        :continue -> result
+      end
+    end
+
+    worker = dispatcher(server, process: process, scan_interval_ms: 60_000)
+    id = event.eventId
+    assert_receive {:committed, ^worker, ^id}, 1000
+    monitor = Process.monitor(worker)
+    Process.exit(worker, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}
+    assert_receive {:idle, restarted}, 1000
+    refute restarted == worker
+    assert_assignment(server, ride.id)
+    assert {:ok, %{status: :processed, attempts: 1}} = Store.get_event(server, id)
+    assert Process.read_timer(:sys.get_state(restarted).timer) > 0
+  end
+
+  test "retryable worker failures use bounded backoff without reserving early", %{
+    server: server,
+    clock: clock
+  } do
+    {ride, event} = pending(server, "retry")
+    count = :atomics.new(1, [])
+
+    process = fn owner, id ->
+      case :atomics.add_get(count, 1, 1) do
+        1 -> raise "controlled worker failure"
+        2 -> {:error, :retryable}
+        _ -> Store.process_event(owner, id)
+      end
+    end
+
+    worker = dispatcher(server, process: process, scan_interval_ms: 60_000)
+    id = event.eventId
+    assert_receive {:result, ^id, {:error, {:retry_at, 1000}}, ^worker}, 1000
+    assert_receive {:idle, ^worker}, 1000
+    assert Store.list_offers(server) == []
+    :atomics.put(clock, 1, 999)
+    EventDispatcher.wake(worker)
+    assert_receive {:idle, ^worker}, 1000
+    assert :atomics.get(count, 1) == 1
+    :atomics.put(clock, 1, 1000)
+    EventDispatcher.wake(worker)
+    assert_receive {:result, ^id, {:error, {:retry_at, 3000}}, ^worker}, 1000
+    :atomics.put(clock, 1, 3000)
+    EventDispatcher.wake(worker)
+    assert_receive {:result, ^id, {:ok, :processed}, ^worker}, 1000
+    assert_assignment(server, ride.id)
+    assert {:ok, %{attempts: 3}} = Store.get_event(server, id)
+    assert [offer] = Store.list_offers(server)
+    assert offer.created_at_ms == 3000 and offer.expires_at_ms == 33_000
+  end
+
+  test "retry exhaustion retains failure without any reservation or immediate rescan", %{
+    server: server,
+    clock: clock
+  } do
+    {ride, event} = pending(server, "failed")
+
+    worker =
+      dispatcher(server, process: fn _, _ -> {:error, :retryable} end, scan_interval_ms: 60_000)
+
+    id = event.eventId
+    assert_receive {:result, ^id, {:error, {:retry_at, 1000}}, ^worker}, 1000
+    :atomics.put(clock, 1, 1000)
+    EventDispatcher.wake(worker)
+    assert_receive {:result, ^id, {:error, {:retry_at, 3000}}, ^worker}, 1000
+    :atomics.put(clock, 1, 3000)
+    EventDispatcher.wake(worker)
+    assert_receive {:result, ^id, {:error, :failed}, ^worker}, 1000
+    assert_receive {:idle, ^worker}, 1000
+    assert {:ok, %{status: :failed, attempts: 3}} = Store.get_event(server, id)
+    assert {:ok, %{status: :matching, assignedDriverId: nil}} = Store.get_ride(server, ride.id)
+    assert {:ok, %{status: :available}} = Store.get_driver(server, "D001")
+    assert Store.list_offers(server) == []
+    assert Store.list_actionable_events(server) == []
+    assert Store.next_event_delay(server) == nil
+    assert Process.read_timer(:sys.get_state(worker).timer) > 0
+  end
+
+  test "uncertain timeout before or after reservation is resolved without duplicate Offers", %{
+    server: server
+  } do
+    # One timeout before processing, then one timeout after the real command commits.
+    {ride, event} = pending(server, "timeout")
+    count = :atomics.new(1, [])
+
+    process = fn owner, id ->
+      if :atomics.add_get(count, 1, 1) > 1, do: Store.process_event(owner, id)
+      exit({:timeout, {:controlled, id}})
+    end
+
+    worker = dispatcher(server, process: process, scan_interval_ms: 60_000)
+    id = event.eventId
+    assert_receive {:result, ^id, {:error, :uncertain}, ^worker}, 1000
+    assert {:ok, pending} = Store.get_event(server, id)
+    assert Map.get(pending, :attempts, 0) == 0
+    assert Store.list_offers(server) == []
+    EventDispatcher.wake(worker)
+    assert_receive {:result, ^id, {:ok, :already_processed}, ^worker}, 1000
+    assert_assignment(server, ride.id)
+    assert {:ok, %{attempts: 1}} = Store.get_event(server, id)
+  end
+
   defp body do
     %{
       "passengerId" => "P001",
