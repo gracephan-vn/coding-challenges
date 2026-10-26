@@ -321,7 +321,8 @@ defmodule RideDispatch.Dispatch.StateServer do
                 else: {:error, :wrong_driver}
 
             [{key, offer}] ->
-              with :ok <- record_identity(offer, key) do
+              with :ok <- record_identity(offer, key),
+                   :ok <- exclusive_acceptance_history(ride, offer, state) do
                 cond do
                   Map.has_key?(offer, :acceptance_result) or Map.has_key?(offer, :accepted_at_ms) ->
                     replay_acceptance(ride, offer, state)
@@ -362,20 +363,12 @@ defmodule RideDispatch.Dispatch.StateServer do
   end
 
   defp current_acceptance_offer(ride, driver, %{status: status} = offer, state)
-       when status in [:pending, :accepted] do
+       when status == :pending do
     cond do
       offer.driverId != driver.id ->
         {:error, :wrong_driver}
 
       not consistent_assignment?(ride, state) ->
-        {:error, :inconsistent_ownership}
-
-      status == :accepted ->
-        if acceptance_receipt?(offer, ride),
-          do: {:replay, offer.acceptance_result},
-          else: {:error, :inconsistent_ownership}
-
-      Map.has_key?(offer, :acceptance_result) or Map.has_key?(offer, :accepted_at_ms) ->
         {:error, :inconsistent_ownership}
 
       true ->
@@ -386,13 +379,27 @@ defmodule RideDispatch.Dispatch.StateServer do
   defp current_acceptance_offer(_ride, _driver, _offer, _state),
     do: {:error, :inconsistent_ownership}
 
+  defp exclusive_acceptance_history(ride, offer, state) do
+    conflict? =
+      Enum.any?(state.offers, fn
+        {key, %{rideId: ride_id} = other} when ride_id == ride.id and key != offer.id ->
+          Map.has_key?(other, :acceptance_result) or Map.has_key?(other, :accepted_at_ms)
+
+        _ ->
+          false
+      end)
+
+    if conflict?, do: {:error, :inconsistent_ownership}, else: :ok
+  end
+
   defp replay_acceptance(ride, offer, state) do
     active? =
-      Map.get(ride, :status) == :driver_accepted and offer.status == :accepted and
+      Map.get(ride, :status) == :driver_accepted and Map.get(offer, :status) == :accepted and
         Map.get(ride, :currentOfferId) == offer.id and consistent_assignment?(ride, state)
 
     terminal? =
-      Map.get(ride, :status) in [:completed, :cancelled] and offer.status == ride.status and
+      Map.get(ride, :status) in [:completed, :cancelled] and
+        Map.get(offer, :status) == ride.status and
         Map.get(ride, :currentOfferId) in [nil, offer.id] and
         Map.get(ride, :assignedDriverId) in [nil, offer.driverId] and
         not Enum.any?(active_offers(state), &(&1.rideId == ride.id))

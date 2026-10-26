@@ -34,7 +34,8 @@ defmodule RideDispatchWeb.RideController do
   end
 
   def accept_offer(conn, _params) do
-    if conn.body_params == %{} do
+    with true <- conn.body_params == %{},
+         {:ok, "", conn} <- read_body(conn, length: 1, read_length: 1) do
       case Rides.accept_offer(
              server(conn),
              conn.path_params["rideId"],
@@ -57,7 +58,8 @@ defmodule RideDispatchWeb.RideController do
           error(conn, 500, "Internal Server Error")
       end
     else
-      error(conn, 400, "Bad Request")
+      {_, _body, conn} -> error(conn, 400, "Bad Request")
+      _ -> error(conn, 400, "Bad Request")
     end
   end
 
