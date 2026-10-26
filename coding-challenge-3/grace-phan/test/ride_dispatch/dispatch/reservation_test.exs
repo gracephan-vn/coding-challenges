@@ -365,6 +365,85 @@ defmodule RideDispatch.Dispatch.ReservationTest do
 
   defp business(state), do: Map.take(state, [:rides, :drivers, :offers, :idempotency])
 
+  test "AC-09: two barrier-released Ride commands compete for one Driver" do
+    for _ <- 1..20 do
+      server = owner(drivers: [driver("D001", 0)])
+      pairs = [matching(server, "A"), matching(server, "B")]
+      parent = self()
+
+      tasks =
+        for {_ride, event} <- pairs do
+          Task.async(fn ->
+            send(parent, {:ready, self()})
+
+            receive do
+              :go -> Store.process_event(server, event.eventId)
+            end
+          end)
+        end
+
+      for task <- tasks, do: assert_receive({:ready, pid} when pid == task.pid)
+      for task <- tasks, do: send(task.pid, :go)
+      assert Enum.map(tasks, &Task.await/1) == [{:ok, :processed}, {:ok, :processed}]
+      assert_competition(server, pairs)
+    end
+  end
+
+  test "two competing Rides may reserve separate eligible Drivers with unique Offers" do
+    server = owner(drivers: [driver("D001", 0), driver("D002", 0.001)])
+    pairs = [matching(server, "A"), matching(server, "B")]
+
+    tasks =
+      for {_ride, event} <- pairs,
+          do: Task.async(fn -> Store.process_event(server, event.eventId) end)
+
+    for task <- tasks, do: assert(Task.await(task) == {:ok, :processed})
+    offers = Store.list_offers(server)
+    assert length(offers) == 2
+    assert offers == Enum.sort_by(offers, & &1.id)
+    assert MapSet.size(MapSet.new(offers, & &1.id)) == 2
+    assert Enum.sort(Enum.map(offers, & &1.driverId)) == ["D001", "D002"]
+
+    for {ride, event} <- pairs do
+      assert {:ok, assigned} = Store.get_ride(server, ride.id)
+      assert assigned.status == :driver_assigned
+      assert {:ok, offer} = Store.get_offer(server, assigned.currentOfferId)
+      assert offer.rideId == ride.id and offer.driverId == assigned.assignedDriverId
+      assert offer.status == :pending
+      assert {:ok, %{status: :offered}} = Store.get_driver(server, offer.driverId)
+
+      assert {:ok, %{status: :processed, outcome: :offer_created}} =
+               Store.get_event(server, event.eventId)
+    end
+  end
+
+  defp assert_competition(server, pairs) do
+    assert [offer] = Store.list_offers(server)
+    assert offer.status == :pending and offer.driverId == "D001"
+    assert {:ok, %{status: :offered}} = Store.get_driver(server, "D001")
+
+    rides =
+      for {ride, _event} <- pairs do
+        {:ok, current} = Store.get_ride(server, ride.id)
+        current
+      end
+
+    assert [winner] = Enum.filter(rides, &(&1.status == :driver_assigned))
+    assert winner.id == offer.rideId and winner.assignedDriverId == "D001"
+    assert winner.currentOfferId == offer.id
+    assert [loser] = Enum.filter(rides, &(&1.status == :matching))
+    assert loser.assignedDriverId == nil and Map.get(loser, :currentOfferId) == nil
+
+    outcomes =
+      for {_ride, event} <- pairs do
+        assert {:ok, %{status: :processed} = done} = Store.get_event(server, event.eventId)
+        done.outcome
+      end
+
+    assert Enum.sort(outcomes) == [:no_candidate, :offer_created]
+    assert length(Store.list_events(server)) == 4
+  end
+
   defp driver(id, longitude, status \\ :available) do
     %{id: id, status: status, latitude: 0.0, longitude: longitude, label: "preserve"}
   end
