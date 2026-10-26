@@ -316,4 +316,40 @@ defmodule RideDispatch.Dispatch.ExpirationTest do
     assert {:reply, {:error, :inconsistent_ownership}, ^input} =
              StateServer.handle_call({:expire_offer, offer.id}, nil, input)
   end
+
+  test "discovery reports missing or contradictory closed receipts instead of omitting corruption" do
+    for action <- [:accept, :reject, :expire] do
+      {server, ride, offer, clock} = reserved()
+
+      case action do
+        :accept ->
+          Store.accept_offer(server, ride.id, "A")
+
+        :reject ->
+          Store.reject_offer(server, ride.id, "A")
+
+        :expire ->
+          :atomics.put(clock, 1, 30_000)
+          Store.expire_offer(server, offer.id)
+      end
+
+      state = :sys.get_state(server)
+
+      field =
+        case action do
+          :accept -> :acceptance_result
+          :reject -> :rejection_receipt
+          :expire -> :expiration_receipt
+        end
+
+      input = put_in(state.offers[offer.id], Map.delete(state.offers[offer.id], field))
+
+      assert {:reply,
+              {:ok, %{pending: [], invalid_offers: [%{offer_id: id, reason: :invalid_evidence}]}},
+              ^input} =
+               StateServer.handle_call(:expiration_schedule, nil, input)
+
+      assert id == offer.id
+    end
+  end
 end

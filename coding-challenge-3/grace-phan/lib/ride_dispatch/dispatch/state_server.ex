@@ -49,7 +49,7 @@ defmodule RideDispatch.Dispatch.StateServer do
           Enum.reduce(state.offers, {[], []}, fn {id, offer}, {pending, invalid} ->
             fingerprint = :erlang.phash2(offer)
 
-            case scheduling_offer(offer, id) do
+            case scheduling_offer(offer, id, state) do
               :ok ->
                 if offer.status == :pending,
                   do:
@@ -414,7 +414,7 @@ defmodule RideDispatch.Dispatch.StateServer do
     end
   end
 
-  defp scheduling_offer(offer, id) do
+  defp scheduling_offer(offer, id, state) do
     if record_identity(offer, id) == :ok and
          Map.get(offer, :status) in [
            :pending,
@@ -428,11 +428,40 @@ defmodule RideDispatch.Dispatch.StateServer do
            value = Map.get(offer, field)
            is_binary(value) and value != "" and String.valid?(value)
          end) do
-      if offer_deadline(offer) == :ok, do: :ok, else: {:error, :invalid_deadline}
+      cond do
+        offer_deadline(offer) != :ok -> {:error, :invalid_deadline}
+        not scheduling_evidence?(offer, state) -> {:error, :invalid_evidence}
+        true -> :ok
+      end
     else
       {:error, :invalid_identity}
     end
   end
+
+  defp scheduling_evidence?(%{status: :pending} = offer, _state),
+    do:
+      not Enum.any?(
+        [:accepted_at_ms, :acceptance_result, :rejection_receipt, :expiration_receipt],
+        &Map.has_key?(offer, &1)
+      )
+
+  defp scheduling_evidence?(%{status: :expired} = offer, state),
+    do: expiration_receipt?(offer, state)
+
+  defp scheduling_evidence?(%{status: status} = offer, state)
+       when status in [:accepted, :rejected] do
+    with {:ok, ride} <- expiration_record(state.rides, offer.rideId) do
+      if status == :accepted,
+        do: acceptance_receipt?(offer, ride),
+        else: rejection_receipt?(offer, ride, state)
+    else
+      _ -> false
+    end
+  end
+
+  # Terminal lifecycle commands are not implemented; retain their basic shape
+  # validation without claiming to verify a future cancellation/completion receipt.
+  defp scheduling_evidence?(_terminal_offer, _state), do: true
 
   defp expiration_pending(ride, driver, offer, state) do
     if ride.status == :driver_assigned and driver.status == :offered and offer.status == :pending and

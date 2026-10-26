@@ -250,6 +250,51 @@ defmodule RideDispatch.Dispatch.ExpirationRematchingTest do
     end
   end
 
+  test "dispatcher restart before or after replacement processing preserves expiration causality" do
+    for commit? <- [false, true] do
+      {server, ride, offer, clock} = reserved()
+      listen(server)
+      Store.set_driver_availability(server, "B", true)
+      :atomics.put(clock, 1, 30_000)
+      assert Store.expire_offer(server, offer.id) == {:ok, :expired}
+      {:ok, expired} = Store.get_offer(server, offer.id)
+      id = "redispatch-expired-" <> offer.id
+      parent = self()
+      calls = :atomics.new(1, [])
+
+      worker =
+        dispatcher(server,
+          process: fn owner, event_id ->
+            if :atomics.add_get(calls, 1, 1) == 1 do
+              if commit?, do: Store.process_event(owner, event_id)
+              send(parent, {:blocked_dispatch, self()})
+
+              receive do
+                :never -> :ok
+              end
+            end
+
+            Store.process_event(owner, event_id)
+          end
+        )
+
+      assert_receive {:blocked_dispatch, ^worker}, 1000
+      ref = Process.monitor(worker)
+      Process.exit(worker, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^worker, :killed}, 1000
+      assert_receive {{:ride_dispatch, :dispatcher, :idle}, %{dispatcher: restarted}}, 1000
+      refute restarted == worker
+
+      assert {:ok, %{assignedDriverId: "B", status: :driver_assigned}} =
+               Store.get_ride(server, ride.id)
+
+      assert Store.get_offer(server, offer.id) == {:ok, expired}
+      assert length(Store.list_offers(server)) == 2
+      assert {:ok, %{status: :processed, attempts: 1}} = Store.get_event(server, id)
+      assert length(Store.list_events(server)) == 3
+    end
+  end
+
   defp connection(server),
     do:
       build_conn()
