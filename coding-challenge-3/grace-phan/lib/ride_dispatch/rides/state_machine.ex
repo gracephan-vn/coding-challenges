@@ -5,7 +5,11 @@ defmodule RideDispatch.Rides.StateMachine do
     {:driver_assigned, :accept_offer} => :driver_accepted,
     {:driver_assigned, :reject_offer} => :matching,
     {:driver_assigned, :expire_offer} => :matching,
-    {:driver_accepted, :complete_ride} => :completed
+    {:driver_accepted, :complete_ride} => :completed,
+    {:requested, :cancel_ride} => :cancelled,
+    {:matching, :cancel_ride} => :cancelled,
+    {:driver_assigned, :cancel_ride} => :cancelled,
+    {:driver_accepted, :cancel_ride} => :cancelled
   }
 
   def transition(%{status: status} = ride, action) do
