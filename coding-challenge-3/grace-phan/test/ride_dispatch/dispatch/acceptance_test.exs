@@ -322,4 +322,74 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
     [offer] = Store.list_offers(server)
     {server, ride, offer, clock}
   end
+
+  test "synthetic terminal lifecycle preserves replay with cleared or retained current identity" do
+    {server, ride, offer, _} = reserved()
+    assert {:ok, accepted} = Store.accept_offer(server, ride.id, "D001")
+    state = :sys.get_state(server)
+
+    for {ride_status, offer_status} <- [completed: :completed, cancelled: :cancelled],
+        clear? <- [true, false] do
+      input = terminal_fixture(state, ride.id, offer.id, ride_status, offer_status, clear?)
+      input = %{input | clock: fn -> raise "replay must not check current time" end}
+
+      assert {:reply, {:ok, ^accepted}, ^input} =
+               StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+
+      broken = update_in(input.offers[offer.id], &Map.delete(&1, :accepted_at_ms))
+
+      assert {:reply, {:error, :inconsistent_ownership}, ^broken} =
+               StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, broken)
+    end
+  end
+
+  test "synthetic terminal replay does not interfere with Driver accepted ownership on another Ride" do
+    {server, ride, offer, _} = reserved()
+    assert {:ok, accepted} = Store.accept_offer(server, ride.id, "D001")
+
+    input =
+      terminal_fixture(:sys.get_state(server), ride.id, offer.id, :completed, :completed, true)
+
+    # Only terminal state is synthetic; all subsequent operations use the real callbacks.
+    assert {:reply, {:ok, other}, input} =
+             StateServer.handle_call({:create_ride, "other", body()}, nil, input)
+
+    created =
+      Enum.find(
+        Map.values(input.pending_events),
+        &(&1.rideId == other.id and &1.type == :ride_created)
+      )
+
+    assert {:reply, {:ok, :processed}, input} =
+             StateServer.handle_call({:process_event, created.eventId}, nil, input)
+
+    assert {:reply, {:ok, :processed}, input} =
+             StateServer.handle_call({:process_event, "dispatch-" <> other.id}, nil, input)
+
+    assert {:reply, {:ok, other_accepted}, input} =
+             StateServer.handle_call({:accept_offer, other.id, "D001"}, nil, input)
+
+    assert input.drivers["D001"].status == :busy
+
+    assert {:reply, {:ok, ^accepted}, ^input} =
+             StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+
+    assert input.rides[other.id] == other_accepted
+  end
+
+  defp terminal_fixture(state, ride_id, offer_id, ride_status, offer_status, clear?) do
+    state =
+      state
+      |> put_in([:rides, ride_id, :status], ride_status)
+      |> put_in([:offers, offer_id, :status], offer_status)
+      |> put_in([:drivers, "D001", :status], :available)
+
+    if clear? do
+      state
+      |> put_in([:rides, ride_id, :assignedDriverId], nil)
+      |> put_in([:rides, ride_id, :currentOfferId], nil)
+    else
+      state
+    end
+  end
 end
