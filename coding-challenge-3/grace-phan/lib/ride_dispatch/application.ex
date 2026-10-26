@@ -13,6 +13,8 @@ defmodule RideDispatch.Application do
       {Phoenix.PubSub, name: RideDispatch.PubSub},
       {RideDispatch.Dispatch.StateServer,
        name: RideDispatch.Dispatch.StateServer, passengers: [%{id: "P001"}]},
+      {RideDispatch.Dispatch.EventDispatcher,
+       name: RideDispatch.Dispatch.EventDispatcher, store: RideDispatch.Dispatch.StateServer},
       # Start to serve requests, typically the last entry
       RideDispatchWeb.Endpoint
     ]

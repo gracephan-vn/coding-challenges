@@ -169,6 +169,32 @@ defmodule RideDispatchWeb.RideControllerTest do
     assert Process.whereis(StateServer) == owner
   end
 
+  test "asynchronous processing changes GET while POST replay retains original creation", %{
+    server: server
+  } do
+    parent = self()
+    handler = make_ref()
+
+    :telemetry.attach(
+      handler,
+      [:ride_dispatch, :event, :processed],
+      fn _, _, metadata, _ ->
+        if metadata.server == server, do: send(parent, {:ride_processed, metadata.result})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    start_supervised!({RideDispatch.Dispatch.EventDispatcher, store: server})
+    original = create(server, body()) |> json_response(201)
+    assert original["data"]["status"] == "REQUESTED"
+    assert_receive {:ride_processed, {:ok, :processed}}, 1000
+    current = read(server, original["data"]["rideId"]) |> json_response(200)
+    assert current == put_in(original, ["data", "status"], "MATCHING")
+    assert create(server, body()) |> json_response(201) == original
+    assert Enum.count(Store.list_events(server), &(&1.type == :dispatch_requested)) == 1
+  end
+
   defp conn(server),
     do:
       build_conn()

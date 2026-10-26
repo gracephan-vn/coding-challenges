@@ -2,6 +2,7 @@ defmodule RideDispatch.Dispatch.StateServer do
   @moduledoc false
   use GenServer
 
+  alias RideDispatch.Rides.StateMachine, as: RideStateMachine
   alias RideDispatch.Rides.Request
   alias RideDispatch.Location
   alias RideDispatch.Drivers.StateMachine
@@ -20,7 +21,9 @@ defmodule RideDispatch.Dispatch.StateServer do
          passengers: passengers,
          rides: %{},
          idempotency: %{},
-         pending_events: %{}
+         pending_events: %{},
+         clock: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end),
+         event_subscribers: %{}
        }}
     else
       {:error, reason} -> {:stop, reason}
@@ -108,6 +111,193 @@ defmodule RideDispatch.Dispatch.StateServer do
       {:error, _} = error -> {:reply, error, state}
     end
   end
+
+  def handle_call(:list_events, _from, state) do
+    {:reply, state.pending_events |> Map.values() |> Enum.sort_by(& &1.eventId), state}
+  end
+
+  def handle_call({:get_event, id}, _from, state) do
+    {:reply, Map.fetch(state.pending_events, id) |> event_result(), state}
+  end
+
+  def handle_call(:list_actionable_events, _from, state) do
+    now = state.clock.()
+
+    events =
+      state.pending_events
+      |> Map.values()
+      |> Enum.filter(&(supported_pending?(&1) and eligible?(&1, now)))
+      |> Enum.sort_by(& &1.eventId)
+
+    {:reply, events, state}
+  end
+
+  def handle_call(:next_event_delay, _from, state) do
+    now = state.clock.()
+
+    delay =
+      state.pending_events
+      |> Map.values()
+      |> Enum.filter(&supported_pending?/1)
+      |> Enum.map(&max(0, (Map.get(&1, :next_attempt_at) || now) - now))
+      |> Enum.min(fn -> nil end)
+
+    {:reply, delay, state}
+  end
+
+  def handle_call(:subscribe_events, {pid, _tag}, state) do
+    subscribers =
+      if Map.has_key?(state.event_subscribers, pid),
+        do: state.event_subscribers,
+        else: Map.put(state.event_subscribers, pid, Process.monitor(pid))
+
+    {:reply, {:ok, self()}, %{state | event_subscribers: subscribers}}
+  end
+
+  def handle_call({:process_event, id}, _from, state) do
+    case Map.fetch(state.pending_events, id) do
+      :error ->
+        {:reply, :not_found, state}
+
+      {:ok, %{status: :processed}} ->
+        {:reply, {:ok, :already_processed}, state}
+
+      {:ok, %{status: :failed}} ->
+        {:reply, {:error, :failed}, state}
+
+      {:ok, event} ->
+        cond do
+          not supported_pending?(event) ->
+            {:reply, {:error, :unsupported_event}, state}
+
+          not eligible?(event, state.clock.()) ->
+            {:reply, {:error, {:retry_at, event.next_attempt_at}}, state}
+
+          true ->
+            process_ride_created(event, state)
+        end
+    end
+  end
+
+  def handle_call({:fail_event, _id, version, :processing_failed}, _from, state)
+      when not is_integer(version) or version < 0 do
+    {:reply, {:error, :invalid_attempt}, state}
+  end
+
+  def handle_call({:fail_event, id, version, :processing_failed}, _from, state) do
+    case Map.fetch(state.pending_events, id) do
+      :error ->
+        {:reply, :not_found, state}
+
+      {:ok, event} ->
+        cond do
+          not supported_pending?(event) ->
+            {:reply, {:error, :not_actionable}, state}
+
+          Map.get(event, :attempts, 0) != version ->
+            {:reply, {:error, :stale_attempt}, state}
+
+          not eligible?(event, state.clock.()) ->
+            {:reply, {:error, {:retry_at, event.next_attempt_at}}, state}
+
+          true ->
+            attempts = version + 1
+            failed = attempts >= 3
+            at = state.clock.() + 1000 * Integer.pow(2, attempts - 1)
+
+            updated =
+              Map.merge(event, %{
+                attempts: attempts,
+                status: if(failed, do: :failed, else: :pending),
+                next_attempt_at: if(failed, do: nil, else: at),
+                last_error: :processing_failed
+              })
+
+            result = if failed, do: {:error, :failed}, else: {:error, {:retry_at, at}}
+            {:reply, result, put_event(state, updated)}
+        end
+    end
+  end
+
+  @impl true
+  def handle_cast(:notify_events, state) do
+    for pid <- Map.keys(state.event_subscribers), do: send(pid, :events_available)
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
+    subscribers =
+      if state.event_subscribers[pid] == ref,
+        do: Map.delete(state.event_subscribers, pid),
+        else: state.event_subscribers
+
+    {:noreply, %{state | event_subscribers: subscribers}}
+  end
+
+  defp process_ride_created(event, state) do
+    case Map.fetch(state.rides, event.rideId) do
+      :error ->
+        permanent_failure(state, event, :ride_not_found)
+
+      {:ok, %{status: :requested} = ride} ->
+        {:ok, matching} = RideStateMachine.transition(ride, :start_matching)
+
+        successor = %{
+          eventId: "dispatch-" <> ride.id,
+          rideId: ride.id,
+          type: :dispatch_requested,
+          status: :pending
+        }
+
+        updated = %{
+          state
+          | rides: Map.put(state.rides, ride.id, matching),
+            pending_events: Map.put_new(state.pending_events, successor.eventId, successor)
+        }
+
+        {:reply, {:ok, :processed}, put_event(updated, processed(event, :matching_started))}
+
+      {:ok, %{status: status}}
+      when status in [:matching, :driver_assigned, :driver_accepted, :cancelled, :completed] ->
+        {:reply, {:ok, :ignored}, put_event(state, processed(event, :incompatible_ride_state))}
+
+      {:ok, _invalid} ->
+        permanent_failure(state, event, :invalid_state)
+    end
+  end
+
+  defp permanent_failure(state, event, reason) do
+    failed =
+      Map.merge(event, %{
+        status: :failed,
+        attempts: Map.get(event, :attempts, 0) + 1,
+        last_error: reason,
+        next_attempt_at: nil
+      })
+
+    {:reply, {:error, {:permanent, reason}}, put_event(state, failed)}
+  end
+
+  defp processed(event, outcome),
+    do:
+      Map.merge(event, %{
+        status: :processed,
+        attempts: Map.get(event, :attempts, 0) + 1,
+        outcome: outcome,
+        next_attempt_at: nil
+      })
+
+  defp put_event(state, event),
+    do: %{state | pending_events: Map.put(state.pending_events, event.eventId, event)}
+
+  defp supported_pending?(event), do: event.type == :ride_created and event.status == :pending
+
+  defp eligible?(event, now),
+    do: is_nil(Map.get(event, :next_attempt_at)) or event.next_attempt_at <= now
+
+  defp event_result({:ok, event}), do: {:ok, event}
+  defp event_result(:error), do: :not_found
 
   defp ride_result(:not_found), do: :not_found
   defp ride_result(ride), do: {:ok, ride}

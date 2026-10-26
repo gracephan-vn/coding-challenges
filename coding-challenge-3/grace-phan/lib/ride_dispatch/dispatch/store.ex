@@ -8,6 +8,15 @@ defmodule RideDispatch.Dispatch.Store do
   """
 
   # Queries
+  @doc "All retained events, sorted by ID, including unsupported pending events."
+  def list_events(server), do: GenServer.call(server, :list_events)
+  @doc "Returns `{:ok, event}` or `:not_found`, including processed/failed records."
+  def get_event(server, id), do: GenServer.call(server, {:get_event, id})
+  @doc "Due supported pending events only; discovery does not claim or mutate work."
+  def list_actionable_events(server), do: GenServer.call(server, :list_actionable_events)
+  @doc "Milliseconds until the next supported pending event is eligible, or nil; uses owner time."
+  def next_event_delay(server), do: GenServer.call(server, :next_event_delay)
+
   @doc "Returns the current Ride as `{:ok, ride}` or `:not_found`."
   def get_ride(server, ride_id), do: GenServer.call(server, {:get_ride, ride_id})
 
@@ -18,6 +27,21 @@ defmodule RideDispatch.Dispatch.Store do
   def list_available_drivers(server), do: GenServer.call(server, :list_available_drivers)
 
   # Commands
+  @doc "Subscribe the calling dispatcher to nonauthoritative wake-up hints."
+  def subscribe_events(server), do: GenServer.call(server, :subscribe_events)
+
+  @doc """
+  Atomically apply RideCreated, acknowledge it and enqueue DispatchRequested.
+  Returns `{:ok, :processed | :already_processed | :ignored}`, `:not_found`,
+  or `{:error, :unsupported_event | :failed | {:retry_at, time} | {:permanent, reason}}`.
+  Unsupported work is never consumed. Duplicate commands leave state unchanged.
+  """
+  def process_event(server, id), do: GenServer.call(server, {:process_event, id})
+
+  @doc "Record a definite worker-side failure with an observed attempt version; never use for a timeout."
+  def fail_event(server, id, version, :processing_failed),
+    do: GenServer.call(server, {:fail_event, id, version, :processing_failed})
+
   @doc """
   Atomically creates a REQUESTED Ride, original result and pending RideCreated
   event. Accepts a nonblank string key and a strict string-keyed request map.
@@ -28,7 +52,11 @@ defmodule RideDispatch.Dispatch.Store do
   A retry after a timeout is safe while this owner survives. Pending events are
   not delivered here; nothing is durable across owner loss.
   """
-  def create_ride(server, key, request), do: GenServer.call(server, {:create_ride, key, request})
+  def create_ride(server, key, request) do
+    result = GenServer.call(server, {:create_ride, key, request})
+    if match?({:ok, _}, result), do: GenServer.cast(server, :notify_events)
+    result
+  end
 
   @doc """
   Enables (`true`) or disables (`false`) availability atomically through the
