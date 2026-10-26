@@ -459,6 +459,17 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
 
   test "synthetic malformed receipt status and Ride state return controlled invariant failures" do
     {server, ride, offer, _} = reserved()
+    pending_state = :sys.get_state(server)
+
+    for input <- [
+          update_in(pending_state.rides[ride.id], &Map.delete(&1, :status)),
+          update_in(pending_state.drivers["D001"], &Map.delete(&1, :status))
+        ] do
+      {_, result, final} = StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+      assert result == {:error, :inconsistent_ownership}
+      assert final == input
+    end
+
     assert {:ok, _} = Store.accept_offer(server, ride.id, "D001")
     state = :sys.get_state(server)
 
@@ -470,6 +481,37 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
       assert result == {:error, :inconsistent_ownership}
       assert final == input
     end
+  end
+
+  test "acceptance and another Ride dispatch compete without creating overlapping ownership" do
+    {server, ride, offer, _} = reserved()
+    {other, dispatch} = matching(server, "competing-dispatch")
+
+    results =
+      compete([
+        fn -> Store.accept_offer(server, ride.id, "D001") end,
+        fn -> Store.process_event(server, dispatch) end
+      ])
+
+    assert [{:ok, accepted}, {:ok, :processed}] = results
+    assert accepted.status == :driver_accepted and accepted.currentOfferId == offer.id
+    assert accepted.assignedDriverId == "D001"
+    assert Store.get_ride(server, ride.id) == {:ok, accepted}
+    assert {:ok, waiting} = Store.get_ride(server, other.id)
+    assert waiting.status == :matching and waiting.assignedDriverId == nil
+    assert Map.get(waiting, :currentOfferId) == nil
+    assert {:ok, %{status: :busy}} = Store.get_driver(server, "D001")
+    assert [receipt] = Store.list_offers(server)
+    assert receipt.id == offer.id and receipt.status == :accepted
+    assert receipt.acceptance_result == accepted
+
+    assert {:ok, %{status: :processed, outcome: :no_candidate}} =
+             Store.get_event(server, dispatch)
+
+    state = :sys.get_state(server)
+    assert map_size(state.pending_events) == 4 and map_size(state.offers) == 1
+    assert Store.accept_offer(server, ride.id, "D001") == {:ok, accepted}
+    assert :sys.get_state(server) == state
   end
 
   test "synthetic successful history for another Driver cannot support a second Ride acceptance" do
