@@ -56,6 +56,7 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
       put_in(state.offers[offer.id].id, "wrong"),
       put_in(state.offers[offer.id].rideId, "wrong"),
       put_in(state.offers[offer.id].driverId, "D002"),
+      put_in(state.offers[offer.id].status, :rejected),
       put_in(state.offers[offer.id], %{}),
       put_in(state.drivers["D001"].status, :available),
       %{state | rides: Map.put(state.rides, "other", duplicate_ride)},
