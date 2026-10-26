@@ -469,11 +469,11 @@ defmodule RideDispatch.Dispatch.StateServer do
                 else: {:error, :wrong_driver}
 
             [{key, offer}] ->
-              with :ok <- record_identity(offer, key),
-                   :ok <- exclusive_acceptance_history(ride, offer, state) do
+              with :ok <- record_identity(offer, key) do
                 cond do
                   Map.has_key?(offer, :acceptance_result) or Map.has_key?(offer, :accepted_at_ms) ->
-                    replay_acceptance(ride, offer, state)
+                    with :ok <- exclusive_acceptance_history(ride, offer, state),
+                         do: replay_acceptance(ride, offer, state)
 
                   Map.get(offer, :status) in [:rejected, :expired, :cancelled, :completed] ->
                     if offer.id == Map.get(ride, :currentOfferId) and
@@ -485,7 +485,8 @@ defmodule RideDispatch.Dispatch.StateServer do
                     {:error, :invalid_transition}
 
                   true ->
-                    current_acceptance_offer(ride, driver, offer, state)
+                    with :ok <- exclusive_acceptance_history(ride, offer, state),
+                         do: current_acceptance_offer(ride, driver, offer, state)
                 end
               end
           end
