@@ -677,7 +677,7 @@ defmodule RideDispatch.Dispatch.StateServer do
 
         :matching ->
           is_nil(Map.get(ride, :assignedDriverId)) and is_nil(Map.get(ride, :currentOfferId)) and
-            not Enum.any?(active_offers(state), &(&1.rideId == ride.id))
+            not Enum.any?(active_offers(state), &(Map.get(&1, :rideId) == ride.id))
 
         status when status in [:cancelled, :completed] ->
           current = Map.get(state.offers, Map.get(ride, :currentOfferId))
@@ -687,7 +687,8 @@ defmodule RideDispatch.Dispatch.StateServer do
               do: is_nil(Map.get(ride, :assignedDriverId)),
               else: Map.get(current, :status) == status
 
-          closed_pointer? and not Enum.any?(active_offers(state), &(&1.rideId == ride.id))
+          closed_pointer? and
+            not Enum.any?(active_offers(state), &(Map.get(&1, :rideId) == ride.id))
 
         _ ->
           false
@@ -835,7 +836,7 @@ defmodule RideDispatch.Dispatch.StateServer do
         Map.get(offer, :status) == ride.status and
         Map.get(ride, :currentOfferId) in [nil, offer.id] and
         Map.get(ride, :assignedDriverId) in [nil, offer.driverId] and
-        not Enum.any?(active_offers(state), &(&1.rideId == ride.id))
+        not Enum.any?(active_offers(state), &(Map.get(&1, :rideId) == ride.id))
 
     if acceptance_receipt?(offer, ride) and (active? or terminal?),
       do: {:replay, offer.acceptance_result},
@@ -934,7 +935,7 @@ defmodule RideDispatch.Dispatch.StateServer do
 
       {:ok, %{id: id, status: :matching} = ride} when id == event.rideId ->
         if is_nil(Map.get(ride, :assignedDriverId)) and is_nil(Map.get(ride, :currentOfferId)) and
-             not Enum.any?(active_offers(state), &(&1.rideId == ride.id)) do
+             not Enum.any?(active_offers(state), &(Map.get(&1, :rideId) == ride.id)) do
           match_driver(event, ride, state)
         else
           permanent_failure(state, event, :inconsistent_ownership)
@@ -957,10 +958,9 @@ defmodule RideDispatch.Dispatch.StateServer do
 
   defp match_driver(event, ride, state) do
     exclusions =
-      state.offers
-      |> Map.values()
-      |> Enum.filter(&(&1.rideId == ride.id and &1.status in [:rejected, :expired]))
-      |> Enum.map(& &1.driverId)
+      for {_key, %{rideId: ride_id, driverId: driver_id, status: status}} <- state.offers,
+          ride_id == ride.id and status in [:rejected, :expired],
+          do: driver_id
 
     case Matcher.nearest(Map.get(ride, :pickup), Map.values(state.drivers),
            radius_km: state.matching_radius_km,
@@ -968,8 +968,8 @@ defmodule RideDispatch.Dispatch.StateServer do
          ) do
       {:ok, driver} ->
         if Map.get(state.drivers, driver.id) != driver or
-             Enum.any?(active_offers(state), &(&1.driverId == driver.id)) or
-             Enum.any?(active_rides(state), &(&1.assignedDriverId == driver.id)) do
+             Enum.any?(active_offers(state), &(Map.get(&1, :driverId) == driver.id)) or
+             Enum.any?(active_rides(state), &(Map.get(&1, :assignedDriverId) == driver.id)) do
           permanent_failure(state, event, :inconsistent_ownership)
         else
           reserve(event, ride, driver, state)
@@ -983,14 +983,25 @@ defmodule RideDispatch.Dispatch.StateServer do
     end
   end
 
+  # Unknown/malformed statuses do not release a known ownership reference.
+  # Unrelated malformed records are reported separately by expiration discovery.
   defp active_offers(state),
-    do: state.offers |> Map.values() |> Enum.filter(&(&1.status in [:pending, :accepted]))
+    do:
+      state.offers
+      |> Map.values()
+      |> Enum.filter(
+        &(is_map(&1) and
+            Map.get(&1, :status) not in [:rejected, :expired, :cancelled, :completed])
+      )
 
   defp active_rides(state),
     do:
       state.rides
       |> Map.values()
-      |> Enum.filter(&(&1.status in [:driver_assigned, :driver_accepted]))
+      |> Enum.filter(
+        &(is_map(&1) and
+            Map.get(&1, :status) not in [:requested, :matching, :cancelled, :completed])
+      )
 
   defp consistent_assignment?(ride, state) do
     offer = Map.get(state.offers, Map.get(ride, :currentOfferId))
@@ -1012,8 +1023,11 @@ defmodule RideDispatch.Dispatch.StateServer do
 
   defp unique_assignment?(ride, driver_id, offer_id, ride_id, state) do
     ride.id == ride_id and ride.assignedDriverId == driver_id and ride.currentOfferId == offer_id and
-      Enum.count(active_offers(state), &(&1.rideId == ride_id or &1.driverId == driver_id)) == 1 and
-      Enum.count(active_rides(state), &(&1.assignedDriverId == driver_id)) == 1
+      Enum.count(
+        active_offers(state),
+        &(Map.get(&1, :rideId) == ride_id or Map.get(&1, :driverId) == driver_id)
+      ) == 1 and
+      Enum.count(active_rides(state), &(Map.get(&1, :assignedDriverId) == driver_id)) == 1
   end
 
   defp reserve(event, ride, driver, state) do
