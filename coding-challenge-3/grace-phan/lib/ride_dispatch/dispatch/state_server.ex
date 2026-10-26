@@ -6,6 +6,7 @@ defmodule RideDispatch.Dispatch.StateServer do
   alias RideDispatch.Rides.Request
   alias RideDispatch.Location
   alias RideDispatch.Drivers.StateMachine
+  alias RideDispatch.Dispatch.Matcher
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
@@ -184,14 +185,17 @@ defmodule RideDispatch.Dispatch.StateServer do
 
       {:ok, event} ->
         cond do
-          not supported_pending?(event) ->
+          event.status != :pending or event.type not in [:ride_created, :dispatch_requested] ->
             {:reply, {:error, :unsupported_event}, state}
 
           not eligible?(event, state.clock.()) ->
             {:reply, {:error, {:retry_at, event.next_attempt_at}}, state}
 
           true ->
-            process_ride_created(event, state)
+            case event.type do
+              :ride_created -> process_ride_created(event, state)
+              :dispatch_requested -> process_dispatch_requested(event, state)
+            end
         end
     end
   end
@@ -281,6 +285,49 @@ defmodule RideDispatch.Dispatch.StateServer do
 
       {:ok, _invalid} ->
         permanent_failure(state, event, :invalid_state)
+    end
+  end
+
+  defp process_dispatch_requested(event, state) do
+    ride = state.rides[event.rideId]
+
+    case Matcher.nearest(ride.pickup, Map.values(state.drivers),
+           radius_km: state.matching_radius_km
+         ) do
+      {:ok, driver} -> reserve(event, ride, driver, state)
+      :none -> {:reply, {:error, :no_candidate}, state}
+      {:error, reason} -> permanent_failure(state, event, reason)
+    end
+  end
+
+  defp reserve(event, ride, driver, state) do
+    with {:ok, offered} <- StateMachine.transition(driver, :reserve_for_offer),
+         {:ok, assigned} <- RideStateMachine.transition(ride, :create_offer),
+         {:ok, now} <- read_clock(state.clock) do
+      id = "offer-" <> Integer.to_string(System.unique_integer([:positive, :monotonic]))
+
+      offer = %{
+        id: id,
+        rideId: ride.id,
+        driverId: driver.id,
+        status: :pending,
+        created_at_ms: now,
+        expires_at_ms: now + state.offer_timeout_ms
+      }
+
+      assigned = Map.merge(assigned, %{assignedDriverId: driver.id, currentOfferId: id})
+
+      updated = %{
+        state
+        | rides: Map.put(state.rides, ride.id, assigned),
+          drivers: Map.put(state.drivers, driver.id, offered),
+          offers: Map.put(state.offers, id, offer)
+      }
+
+      {:reply, {:ok, :processed}, put_event(updated, processed(event, :offer_created))}
+    else
+      {:error, :invalid_clock} = error -> {:reply, error, state}
+      {:error, reason} -> permanent_failure(state, event, reason)
     end
   end
 
