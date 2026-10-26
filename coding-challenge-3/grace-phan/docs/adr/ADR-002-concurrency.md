@@ -52,7 +52,8 @@ No external database or ETS is used in the current implementation.
   driver map and sorts results; large lists can delay unrelated calls. Future
   matching in callbacks can also be expensive. Avoid blocking external I/O there.
 - A process crash loses volatile runtime state. Supervision restarts from startup
-  seeds, not the lost updates. The current application starts with empty seeds.
+  seeds, not the lost updates. Phase B started with empty seeds; the current
+  application seeds Passenger P001 and no Drivers.
 - Consistency is single-node and single-owner. Multiple independent owners on
   different nodes would not enforce global uniqueness or reservation safety.
 - Concurrent senders have no guaranteed ordering. Whole location updates use
