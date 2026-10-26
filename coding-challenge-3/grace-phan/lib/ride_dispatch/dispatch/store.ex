@@ -20,6 +20,8 @@ defmodule RideDispatch.Dispatch.Store do
   Driver State Machine. Repeated requests succeed unchanged.
 
   Returns `{:ok, driver}`, `:not_found`, or the State Machine's error tuple.
+  Nonboolean input returns `{:error, :invalid_availability}`. Unknown IDs take
+  precedence over input validation, consistent with location commands.
   Other driver fields are preserved; rejected transitions leave state unchanged.
   """
   def set_driver_availability(server, driver_id, available?) do

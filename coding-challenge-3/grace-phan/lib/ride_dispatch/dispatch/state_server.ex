@@ -59,7 +59,7 @@ defmodule RideDispatch.Dispatch.StateServer do
       :error ->
         {:reply, :not_found, state}
 
-      {:ok, driver} ->
+      {:ok, driver} when is_boolean(available?) ->
         action = if available?, do: :enable_availability, else: :disable_availability
 
         case StateMachine.transition(driver, action) do
@@ -70,6 +70,9 @@ defmodule RideDispatch.Dispatch.StateServer do
           {:error, _reason} = error ->
             {:reply, error, state}
         end
+
+      {:ok, _driver} ->
+        {:reply, {:error, :invalid_availability}, state}
     end
   end
 
