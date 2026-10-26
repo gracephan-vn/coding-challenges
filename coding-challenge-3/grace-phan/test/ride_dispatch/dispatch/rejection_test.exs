@@ -225,6 +225,92 @@ defmodule RideDispatch.Dispatch.RejectionTest do
              StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
   end
 
+  test "stale Accept after replacement acceptance is a conflict, not invariant corruption" do
+    {server, ride, offer, _} = reserved()
+    assert {:ok, _} = Store.reject_offer(server, ride.id, "A")
+    assert {:ok, _} = Store.set_driver_availability(server, "B", true)
+    assert {:ok, :processed} = Store.process_event(server, "redispatch-" <> offer.id)
+    assert {:ok, accepted} = Store.accept_offer(server, ride.id, "B")
+    before = :sys.get_state(server)
+    assert Store.accept_offer(server, ride.id, "A") == {:error, :invalid_transition}
+    assert :sys.get_state(server) == before
+    assert before.drivers["B"].status == :busy
+    assert before.offers[accepted.currentOfferId].acceptance_result == accepted
+    # Still distinguish real broken evidence on the old Offer from a stale request.
+    broken = put_in(before.offers[offer.id], Map.put(before.offers[offer.id], :accepted_at_ms, 0))
+
+    assert {:reply, {:error, :inconsistent_ownership}, ^broken} =
+             StateServer.handle_call({:accept_offer, ride.id, "A"}, nil, broken)
+  end
+
+  test "first-time competing Rejects perform exactly one transition and event insertion" do
+    {server, ride, offer, _} = reserved()
+    before = :sys.get_state(server)
+    results = competing(List.duplicate(fn -> Store.reject_offer(server, ride.id, "A") end, 10))
+    assert [{:ok, result}] = Enum.uniq(results)
+    after_reject = :sys.get_state(server)
+    assert after_reject.rides[ride.id] == result
+    assert after_reject.drivers["A"].status == :available
+    assert after_reject.offers[offer.id].status == :rejected
+    assert map_size(after_reject.offers) == 1
+
+    assert Map.keys(after_reject.pending_events) -- Map.keys(before.pending_events) == [
+             "redispatch-" <> offer.id
+           ]
+
+    assert after_reject.offers[offer.id].rejection_receipt.original_result == result
+  end
+
+  test "ordered Accept/Reject outcomes and barrier-released competing callers preserve all records" do
+    for order <- [:accept_first, :reject_first, :competing] do
+      for _ <- 1..8 do
+        {server, ride, offer, _} = reserved()
+        before = :sys.get_state(server)
+        accept = fn -> Store.accept_offer(server, ride.id, "A") end
+        reject = fn -> Store.reject_offer(server, ride.id, "A") end
+
+        results =
+          case order do
+            :accept_first ->
+              [accept.(), reject.()]
+
+            :reject_first ->
+              rejected = reject.()
+              [accept.(), rejected]
+
+            :competing ->
+              competing([accept, reject])
+          end
+
+        after_race = :sys.get_state(server)
+
+        case results do
+          [{:ok, accepted}, {:error, :invalid_transition}] ->
+            assert after_race.rides[ride.id] == accepted
+            assert accepted.status == :driver_accepted
+            assert after_race.drivers["A"].status == :busy
+            assert after_race.offers[offer.id].status == :accepted
+            assert after_race.offers[offer.id].acceptance_result == accepted
+            refute Map.has_key?(after_race.offers[offer.id], :rejection_receipt)
+            assert after_race.pending_events == before.pending_events
+
+          [{:error, :invalid_transition}, {:ok, matching}] ->
+            assert after_race.rides[ride.id] == matching
+            assert matching.status == :matching
+            assert matching.assignedDriverId == nil and matching.currentOfferId == nil
+            assert after_race.drivers["A"].status == :available
+            assert after_race.offers[offer.id].status == :rejected
+            refute Map.has_key?(after_race.offers[offer.id], :acceptance_result)
+            assert after_race.pending_events["redispatch-" <> offer.id].status == :pending
+            assert map_size(after_race.pending_events) == map_size(before.pending_events) + 1
+        end
+
+        assert map_size(after_race.offers) == 1
+        assert after_race.idempotency == before.idempotency
+      end
+    end
+  end
+
   defp competing(functions) do
     parent = self()
 
