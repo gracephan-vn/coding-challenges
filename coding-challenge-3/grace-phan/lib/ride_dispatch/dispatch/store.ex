@@ -82,7 +82,7 @@ defmodule RideDispatch.Dispatch.Store do
   def accept_offer(server, ride_id, driver_id),
     do: GenServer.call(server, {:accept_offer, ride_id, driver_id})
 
-  @doc "Subscribe the calling dispatcher to nonauthoritative wake-up hints."
+  @doc "Subscribe a dispatcher or scheduler to nonauthoritative wake-up hints."
   def subscribe_events(server), do: GenServer.call(server, :subscribe_events)
 
   @doc """
@@ -94,7 +94,11 @@ defmodule RideDispatch.Dispatch.Store do
   or `{:error, :unsupported_event | :failed | :invalid_clock | {:retry_at, time} | {:permanent, reason}}`.
   Unsupported work is never consumed. Duplicate commands leave state unchanged.
   """
-  def process_event(server, id), do: GenServer.call(server, {:process_event, id})
+  def process_event(server, id) do
+    result = GenServer.call(server, {:process_event, id})
+    if result == {:ok, :processed}, do: GenServer.cast(server, :notify_events)
+    result
+  end
 
   @doc "Record a definite worker-side failure with an observed attempt version; never use for a timeout."
   def fail_event(server, id, version, :processing_failed),
