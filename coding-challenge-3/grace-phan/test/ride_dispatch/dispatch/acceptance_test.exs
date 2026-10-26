@@ -201,6 +201,46 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
     {ride, "dispatch-" <> ride.id}
   end
 
+  test "barrier-released identical acceptance calls return one immutable result" do
+    {server, ride, offer, clock} = reserved()
+    :atomics.put(clock, 1, 99)
+    before = :sys.get_state(server)
+    results = compete(for _ <- 1..10, do: fn -> Store.accept_offer(server, ride.id, "D001") end)
+    assert [{:ok, accepted}] = Enum.uniq(results)
+    assert {:ok, %{status: :busy}} = Store.get_driver(server, "D001")
+    assert Store.get_ride(server, ride.id) == {:ok, accepted}
+    assert [receipt] = Store.list_offers(server)
+    assert receipt.id == offer.id and receipt.status == :accepted
+    assert receipt.accepted_at_ms == 99 and receipt.acceptance_result == accepted
+    assert accepted.currentOfferId == offer.id and accepted.assignedDriverId == "D001"
+    assert accepted.status == :driver_accepted
+    after_acceptance = :sys.get_state(server)
+    assert after_acceptance.pending_events == before.pending_events
+    assert after_acceptance.idempotency == before.idempotency
+    assert after_acceptance.drivers["D002"] == before.drivers["D002"]
+    assert Store.accept_offer(server, ride.id, "D001") == {:ok, accepted}
+    assert :sys.get_state(server) == after_acceptance
+  end
+
+  defp compete(functions) do
+    parent = self()
+
+    tasks =
+      for function <- functions do
+        Task.async(fn ->
+          send(parent, {:ready, self()})
+
+          receive do
+            :go -> function.()
+          end
+        end)
+      end
+
+    for task <- tasks, do: assert_receive({:ready, pid} when pid == task.pid)
+    for task <- tasks, do: send(task.pid, :go)
+    Enum.map(tasks, &Task.await/1)
+  end
+
   defp reserved do
     clock = :atomics.new(1, [])
     server = owner(fn -> :atomics.get(clock, 1) end)
