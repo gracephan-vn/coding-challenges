@@ -328,7 +328,10 @@ defmodule RideDispatch.Dispatch.StateServer do
                     replay_acceptance(ride, offer, state)
 
                   Map.get(offer, :status) in [:rejected, :expired, :cancelled, :completed] ->
-                    {:error, :invalid_transition}
+                    if offer.id == Map.get(ride, :currentOfferId) and
+                         Map.get(ride, :status) in [:driver_assigned, :driver_accepted],
+                       do: {:error, :inconsistent_ownership},
+                       else: {:error, :invalid_transition}
 
                   offer.id != Map.get(ride, :currentOfferId) ->
                     {:error, :invalid_transition}
