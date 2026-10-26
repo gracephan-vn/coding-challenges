@@ -48,7 +48,7 @@ defmodule RideDispatch.Dispatch.StateServer do
          {:ok, driver} <- Map.fetch(state.drivers, driver_id),
          :ok <- record_identity(ride, ride_id),
          :ok <- record_identity(driver, driver_id),
-         {:ok, offer} <- current_acceptance_offer(ride, driver, state) do
+         {:ok, offer} <- resolve_acceptance_offer(ride, driver, state) do
       accept_pending(ride, driver, offer, state)
     else
       {:replay, result} -> {:reply, {:ok, result}, state}
@@ -302,40 +302,86 @@ defmodule RideDispatch.Dispatch.StateServer do
   defp record_identity(%{id: id}, id), do: :ok
   defp record_identity(_record, _id), do: {:error, :inconsistent_ownership}
 
-  defp current_acceptance_offer(ride, driver, state) do
+  defp resolve_acceptance_offer(ride, driver, state) do
+    history =
+      for {key, %{rideId: ride_id, driverId: driver_id} = offer} <- state.offers,
+          ride_id == ride.id and driver_id == driver.id,
+          do: {key, offer}
+
+    case history do
+      [_, _ | _] ->
+        {:error, :ambiguous_offer}
+
+      _ ->
+        with :ok <- current_offer_link(ride, state) do
+          case history do
+            [] ->
+              if is_nil(Map.get(ride, :currentOfferId)),
+                do: :not_found,
+                else: {:error, :wrong_driver}
+
+            [{key, offer}] ->
+              with :ok <- record_identity(offer, key) do
+                cond do
+                  Map.get(offer, :status) in [:rejected, :expired, :cancelled, :completed] ->
+                    {:error, :invalid_transition}
+
+                  offer.id != Map.get(ride, :currentOfferId) ->
+                    {:error, :invalid_transition}
+
+                  true ->
+                    current_acceptance_offer(ride, driver, offer, state)
+                end
+              end
+          end
+        end
+    end
+  end
+
+  defp current_offer_link(ride, state) do
+    current_id = Map.get(ride, :currentOfferId)
+    ride_id = ride.id
+    driver_id = Map.get(ride, :assignedDriverId)
+
     case Map.fetch(state.offers, Map.get(ride, :currentOfferId)) do
       :error ->
-        if Map.get(ride, :status) == :driver_assigned or
-             not is_nil(Map.get(ride, :currentOfferId)),
+        if Map.get(ride, :status) in [:driver_assigned, :driver_accepted] or
+             not is_nil(current_id),
            do: {:error, :inconsistent_ownership},
-           else: :not_found
+           else: :ok
 
-      {:ok, %{id: id, rideId: ride_id, driverId: driver_id, status: status} = offer}
-      when status in [:pending, :accepted] ->
-        cond do
-          id != Map.get(ride, :currentOfferId) or ride_id != ride.id or
-              driver_id != Map.get(ride, :assignedDriverId) ->
-            {:error, :inconsistent_ownership}
-
-          driver_id != driver.id ->
-            {:error, :wrong_driver}
-
-          not consistent_assignment?(ride, state) ->
-            {:error, :inconsistent_ownership}
-
-          status == :accepted ->
-            if acceptance_receipt?(offer, ride),
-              do: {:replay, offer.acceptance_result},
-              else: {:error, :inconsistent_ownership}
-
-          true ->
-            {:ok, offer}
-        end
+      {:ok, %{id: ^current_id, rideId: ^ride_id, driverId: ^driver_id}} ->
+        :ok
 
       {:ok, _invalid} ->
         {:error, :inconsistent_ownership}
     end
   end
+
+  defp current_acceptance_offer(ride, driver, %{status: status} = offer, state)
+       when status in [:pending, :accepted] do
+    cond do
+      offer.driverId != driver.id ->
+        {:error, :wrong_driver}
+
+      not consistent_assignment?(ride, state) ->
+        {:error, :inconsistent_ownership}
+
+      status == :accepted ->
+        if acceptance_receipt?(offer, ride),
+          do: {:replay, offer.acceptance_result},
+          else: {:error, :inconsistent_ownership}
+
+      Map.has_key?(offer, :acceptance_result) or Map.has_key?(offer, :accepted_at_ms) ->
+        {:error, :inconsistent_ownership}
+
+      true ->
+        {:ok, offer}
+    end
+  end
+
+  defp current_acceptance_offer(_ride, _driver, _offer, _state),
+    do: {:error, :inconsistent_ownership}
 
   defp accept_pending(ride, driver, offer, state) do
     with :ok <- offer_deadline(offer),
