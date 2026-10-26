@@ -128,15 +128,20 @@ defmodule RideDispatch.Dispatch.ExpirationSchedulerTest do
                 expire: fn owner, id ->
                   send(parent, {:expire_call, owner, id})
 
-                  if :atomics.add_get(calls, 1, 1) == 1 do
-                    send(parent, {:blocked, self()})
+                  case :atomics.add_get(calls, 1, 1) do
+                    1 ->
+                      {:error, :retryable}
 
-                    receive do
-                      :go -> :ok
-                    end
+                    2 ->
+                      send(parent, {:blocked, self()})
+
+                      receive do
+                        :go -> Store.expire_offer(owner, id)
+                      end
+
+                    _ ->
+                      Store.expire_offer(owner, id)
                   end
-
-                  Store.expire_offer(owner, id)
                 end
               )
           end
@@ -171,6 +176,15 @@ defmodule RideDispatch.Dispatch.ExpirationSchedulerTest do
     old_tick = :sys.get_state(worker).tick
     :atomics.put(clock, 1, old_offer.expires_at_ms)
     ExpirationScheduler.wake(worker)
+
+    assert_receive {{:ride_dispatch, :expiration, :result},
+                    %{result: {:error, :retryable}, scheduler: ^worker}},
+                   1000
+
+    assert_receive {{:ride_dispatch, :expiration, :idle}, %{scheduler: ^worker}}, 1000
+    assert :sys.get_state(worker).retries[old_offer.id].attempts == 1
+    :atomics.put(clock, 1, old_offer.expires_at_ms + 1000)
+    ExpirationScheduler.wake(worker)
     assert_receive {:blocked, ^worker}, 1000
     assert_receive {:expire_call, ^old_owner, old_id}, 1000
     assert old_id == old_offer.id
@@ -192,6 +206,7 @@ defmodule RideDispatch.Dispatch.ExpirationSchedulerTest do
 
     local = :sys.get_state(worker)
     assert local.owner == replacement and local.tick != old_tick
+    assert local.retries == %{} and local.diagnostics == %{}
     assert Store.get_offer(replacement, old_id) == :not_found
     assert Store.list_events(replacement) == []
 
