@@ -36,6 +36,50 @@ defmodule RideDispatch.Dispatch.ReservationTest do
     assert {:ok, _state} = StateServer.init(clock: fn -> -1_000_000 end)
   end
 
+  test "one Store command reserves and acknowledges against current authoritative state" do
+    driver = driver("D001", 0.001)
+    server = owner(drivers: [driver])
+    {ride, event} = matching(server, "reserve")
+    original = :sys.get_state(server).idempotency
+
+    assert Store.process_event(server, event.eventId) == {:ok, :processed}
+    assert {:ok, assigned} = Store.get_ride(server, ride.id)
+    assert assigned.status == :driver_assigned
+    assert assigned.assignedDriverId == driver.id
+    assert {:ok, reserved} = Store.get_driver(server, driver.id)
+    assert reserved == %{driver | status: :offered}
+    assert [offer] = Store.list_offers(server)
+    assert assigned.currentOfferId == offer.id
+    assert offer == %{
+             id: offer.id, rideId: ride.id, driverId: driver.id, status: :pending,
+             created_at_ms: 0, expires_at_ms: 30_000
+           }
+    refute offer.id in [ride.id, driver.id, event.eventId]
+    assert Store.get_offer(server, offer.id) == {:ok, offer}
+    assert {:ok, %{status: :processed, outcome: :offer_created}} =
+             Store.get_event(server, event.eventId)
+    assert :sys.get_state(server).idempotency == original
+    assert Store.create_ride(server, "reserve", body()) == {:ok, ride}
+    assert Store.list_offers(owner()) == []
+  end
+
+  defp body do
+    %{"passengerId" => "P001", "pickup" => %{"latitude" => 0, "longitude" => 0},
+      "destination" => %{"latitude" => 1, "longitude" => 1}}
+  end
+
+  defp driver(id, longitude, status \\ :available) do
+    %{id: id, status: status, latitude: 0.0, longitude: longitude, label: "preserve"}
+  end
+
+  defp matching(server, key) do
+    {:ok, ride} = Store.create_ride(server, key, body())
+    event = Enum.find(Store.list_events(server), &(&1.rideId == ride.id and &1.type == :ride_created))
+    assert Store.process_event(server, event.eventId) == {:ok, :processed}
+    dispatch = Enum.find(Store.list_events(server), &(&1.rideId == ride.id and &1.type == :dispatch_requested))
+    {ride, dispatch}
+  end
+
   defp owner(opts \\ []) do
     opts = Keyword.merge([passengers: [%{id: "P001"}], clock: fn -> 0 end], opts)
     start_supervised!(Supervisor.child_spec({StateServer, opts}, id: make_ref()))
