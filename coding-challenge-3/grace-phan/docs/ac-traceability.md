@@ -34,15 +34,15 @@ Module names below are under `RideDispatch`; controller names are under
 | AC | Required behavior | Implemented modules/functions/routes | Relevant automated tests | Status | Remaining work |
 |---|---|---|---|---|---|
 | AC-01 | Create/retrieve a unique REQUESTED ride; validate passenger and coordinates; require idempotency key, replay original result, reject changed payload | `Rides.create_ride/3`, `Rides.get_ride/2`, `Rides.Request.normalize/1`, `Store.create_ride/3`, `Store.get_ride/2`; atomic StateServer callback; seeded P001; `POST /rides`, `GET /rides/:rideId` | Request tests (3), Ride Store tests (7), Ride HTTP tests (9): coordinates/boundaries, strict fields, passenger validation, unique IDs, retrieval, 201 replay, conflicts and competing duplicates; full suite 116 passed | VERIFIED | Creation contract verified; Feature #10A HTTP test also verifies original POST replay after the real asynchronous MATCHING transition |
-| AC-02 | Availability API, OFFERED/BUSY rules and coordinated lifecycle release | Driver State Machine, availability Store/API, atomic DispatchRequested reservation | Existing Driver tests plus reservation/HTTP integration verify real AVAILABLE → OFFERED, OFFERED cannot receive another Offer or enable/disable availability, and field preservation | PARTIAL | Acceptance, rejection, timeout, cancellation/completion and real BUSY lifecycle/HTTP evidence |
+| AC-02 | Availability API, OFFERED/BUSY rules and coordinated lifecycle release | Driver State Machine, Store availability/reservation/acceptance commands and HTTP routes | Real AVAILABLE → OFFERED → BUSY, wrong-holder rejection, exclusive reservation and real OFFERED/BUSY availability HTTP conflicts; pure release transitions | PARTIAL | Implement reject/expire/cancel/complete coordinated release; supporting pure transitions do not complete those workflows |
 | AC-03 | Update valid coordinates, reject invalid ones, store and match using latest location | Location, Store.update_driver_location/3, PUT /drivers/:id/location; StateServer passes current Driver records to Matcher | Location/Store/Driver HTTP tests plus reservation latest-location test and Ride HTTP integration prove an update changes selected Driver | VERIFIED | No remaining specified clause; stale-update timestamp detection is not implemented or required |
 | AC-04 | Ride-triggered nearest AVAILABLE matching; default/configurable 2 km radius; distance ordering, outside/none/ties; valid coordinates | Location.distance_km/2, Matcher.nearest/3 (minimum `{distance, id}` ordering), Store.process_event/2; authoritative DispatchRequested handler | Pure Matcher/Haversine tests plus reservation default/custom/exact-boundary/just-outside/tie/no-candidate checks and actual asynchronous Ride creation → reservation | VERIFIED | No remaining specified clause; scans approximate spherical distance and no performance claim is made |
-| AC-05 | Pending Offer creation, current-holder accept/reject, coordinated transitions, permanent exclusions, 30s configurable timeout and rematching/release | Atomic pending Offer/Ride/Driver/Event reservation; currentOfferId; retained offers; read-only get_offer/2 and list_offers/1; Offer.expired?/2 deadline contract | Reservation tests prove pending status, ownership, defaults/custom deadline, delayed-event deadline origin, expired-but-unreleased protection; synthetic rejected/expired history supplies Ride-local exclusions | PARTIAL | Implement accept/reject/expiration ownership and exact-deadline enforcement, timeout scheduler, cancellation/completion and real rematching; history fixtures do not prove lifecycle integration |
-| AC-06 | Explicit Ride lifecycle, invalid/duplicate handling, terminal states and coordinated release/assignment cleanup | Pure Rides.StateMachine.transition/2; stored REQUESTED → MATCHING → DRIVER_ASSIGNED through atomic event handlers | Ride state tests plus reservation, duplicate-event, synthetic terminal/inconsistent state and HTTP/current versus original-result tests | PARTIAL | Persist accepted/rejected/expired/cancelled/completed lifecycle transitions, clear assignment/current Offer on release and prove stale-command safety |
+| AC-05 | Pending/current-holder Offer lifecycle, coordinated acceptance/rejection, permanent Ride-scoped exclusions, timeout and rematching/release | Atomic reservation and Store.accept_offer/3; exact currentOfferId; immutable acceptance evidence; POST /rides/:rideId/offers/:driverId/accept | Acceptance Store (18) and HTTP (10) tests cover identities, active ownership, deadline equality, expired-but-held reservation, replay, ambiguity and concurrent duplicates | PARTIAL | Reject/expiration/scheduler, rematching, cancellation/completion and live terminal lifecycle evidence remain absent |
+| AC-06 | Explicit Ride lifecycle, invalid/duplicate handling, terminal states and coordinated release/assignment cleanup | Pure Ride State Machine; stored REQUESTED → MATCHING → DRIVER_ASSIGNED → DRIVER_ACCEPTED; Store replay intercepts duplicate acceptance before pure transitions | Pure state tests, reservation/event tests, acceptance Store/HTTP; terminal replay uses labeled synthetic callbacks and never mutates terminal state | PARTIAL | Persist reject/expire/cancel/complete workflows and prove release, assignment cleanup and lifecycle races through legitimate integration |
 | AC-07 | Rejection causes rematching; permanent same-Ride exclusions; other-Ride eligibility; no candidate stays MATCHING/nil | Reservation derives exclusions from retained rejected/expired Offers and passes them to Matcher; no-candidate acknowledgement | Pure Matcher and synthetic callback history tests verify Ride scope, another Driver, exhaustion and no new Offer; live no-candidate Store tests | PARTIAL | Real reject/timeout commands must record history, release Driver, clear assignment and enqueue a fresh dispatch event; automatic rematching is absent |
-| AC-08 | Duplicate-safe Ride creation, Driver acceptance and Ride transitions; documented strategy | Creation idempotency; retained processed events; current ownership checks for distinct DispatchRequested IDs | Creation tests, Event Store/Dispatcher, reservation same-event replay, synthetic distinct-event IDs, restart/timeout tests and POST replay after assignment | PARTIAL | Driver acceptance and remaining lifecycle command idempotency; state loss is not crash-durable |
-| AC-09 | Prevent two simultaneous offers/accepted rides for one Driver; two distinct Rides compete; document race/strategy | One StateServer callback selects/reserves/acknowledges; checks active Offer and Ride ownership, including contradictory AVAILABLE records; ADR-002 and README | 20 barrier-released live two-Ride runs inspect both Rides, Driver, all Offers/Events; real EventDispatcher versus Store caller; synthetic active/accepted ownership protection | PARTIAL | Pending reservation concurrency is proven. Accepted-Ride lifecycle concurrency remains unverified until acceptance integration; do not infer it from GenServer or fixtures |
-| AC-10 | Ride Created → asynchronous dispatch event → Driver matching; README explains async choice, duplicate delivery and failure | One supervised EventDispatcher; Store discovery/process/fail APIs; atomic RideCreated and DispatchRequested handlers | Event Store (6), EventDispatcher (10), reservation (22), reservation dispatcher (9), Ride HTTP (11 total): full async flow, historical handoff, competing callers, restart, recovery, retries/exhaustion and timeout rechecks | VERIFIED | Specified event-driven matching flow verified; Offer lifecycle remains under AC-05/06/07/08/09. No durable delivery or external-side-effect transaction claim |
+| AC-08 | Demonstrate idempotency for keyed Ride creation, Driver acceptance and Ride state transition; document strategy | Canonical creation records; retained processed events/current ownership; accepted Offer retains accepted_at_ms and original Ride acceptance_result | Creation tests plus duplicate event/Ride transitions; ten barrier-released acceptance callers, five HTTP callers, discarded-response and late replay; malformed receipts rejected; synthetic terminal compatibility clearly labeled | VERIFIED | All specified minimum behaviors have executed evidence and README strategy. Future reject/expire/cancel/complete commands still need their own idempotency tests; no crash-durable guarantee |
+| AC-09 | Identify race, prevent simultaneous offers/accepted Rides for one Driver, test two different competing Rides and document strategy | Single authoritative callback validates reservation/acceptance and all active ownership; BUSY excluded by Matcher; ADR-002 and README | Existing 20 live reservation race runs, 10 pending-to-accepted two-Ride runs, accept-versus-other-dispatch contention, concurrent identical acceptance and real dispatcher BUSY exclusion; final Rides/Driver/Offers/Events asserted | VERIFIED | Required pending/accepted assignment safety verified for implemented workflows. Original-loser fresh redispatch is synthetic because no trigger exists; future release/rematch races require integration tests |
+| AC-10 | Ride Created → asynchronous dispatch event → Driver matching; README explains async choice, duplicate delivery and failure | One supervised EventDispatcher; Store discovery/process/fail APIs; atomic RideCreated and DispatchRequested handlers | Event Store (6), EventDispatcher (10), reservation (22), reservation dispatcher (10), Ride HTTP (11 total): full async flow, historical handoff, competing callers, restart, recovery, retries/exhaustion and timeout rechecks | VERIFIED | Specified event-driven matching flow verified; Offer lifecycle remains under AC-05/06/07/08/09. No durable delivery or external-side-effect transaction claim |
 
 ## Feature #9 verification
 
@@ -68,7 +68,7 @@ worker crash tests kill real dispatcher processes before and after commit.
 Owner replacement tests demonstrate volatile state loss and reconnect behavior.
 Unsupported pending work is excluded from actionable selection but remains queryable.
 
-## Feature #10B verification
+## Feature #10B verification (historical)
 
 Executed: reservation **22 passed**, reservation dispatcher **9 passed**; focused
 Store/event/Location/Matcher/Driver and Ride State Machine/HTTP regressions:
@@ -93,18 +93,56 @@ Driver map identity) were reproduced RED and fixed GREEN. No unresolved P0/P1
 finding was identified. Unknown unsupported events remain pending; #10A pending
 DispatchRequested work becomes supported without reopening RideCreated.
 
+## Feature #11 verification
+
+Executed: [acceptance Store tests](../test/ride_dispatch/dispatch/acceptance_test.exs)
+**18 passed**; [HTTP acceptance tests](../test/ride_dispatch_web/controllers/offer_acceptance_test.exs)
+**10 passed**. The reservation dispatcher suite now has 10 tests, including
+async reservation → acceptance → BUSY exclusion. Focused Store/state-machine/
+reservation/event/HTTP regressions **156 passed**; full `mix test` **194 passed**.
+Compilation with warnings as errors, formatting and diff checks passed.
+
+Meaningful RED/GREEN groups cover first acceptance, exact identity/ownership,
+processing-time deadline, immutable replay, ambiguity/stale attempts, synthetic
+terminal replay, HTTP route/contracts and audit failures. Passing concurrency
+regressions were committed honestly without reconstructing RED history.
+
+Acceptance changes only the exact Ride/Driver/Offer together. It creates no Event
+or Offer and leaves creation idempotency unchanged. Receipt validation precedes
+new-attempt clock checks; equality expires first attempts while successful late
+replay changes nothing. Same-pair history is conservatively ambiguous; URL Driver
+identity does not authenticate the network caller. All success/error schemas use
+existing envelopes. Raw malformed JSON and unread nonempty bodies are tested.
+
+Actual live evidence: ten competing Store callers, five competing HTTP callers,
+ten two-Ride pending-to-accepted races, acceptance competing with another Ride's
+dispatch, real dispatcher BUSY exclusion and real BUSY HTTP availability conflict.
+Two terminal-state compatibility tests use standalone snapshots: no live terminal
+or release workflow is claimed. A fresh event for the original losing Ride is
+synthetic; replaying its acknowledged event is explicitly not another match.
+Discarded responses model lost results, not a real TCP disconnect.
+
+P2 audit gaps in malformed receipt/state handling, broken active-state classification,
+conflicting prior success and unparsed HTTP bodies were reproduced with failing tests and fixed. No unresolved
+P0/P1 finding was identified. Accepted ADRs and original specification are unchanged.
+No rejection, expiration, cancellation, completion, rematching, scheduler,
+authentication infrastructure or new dependency was added.
+
 ## Evidence boundaries and documentation gaps
 
 - Driver HTTP tests use raw JSON through the Endpoint parser. Malformed JSON
   syntax is checked with `assert_error_sent`; parsed invalid fields are checked
   separately. Original conflict mapping uses a protocol fixture; Feature #10B also verifies
-  real OFFERED HTTP conflicts after reservation. BUSY lifecycle remains absent.
+  real OFFERED HTTP conflicts after reservation and Feature #11 verifies real BUSY
+  conflicts after acceptance. Ambiguity/stale/invariant response mapping also uses
+  an explicitly labeled response-only protocol fixture, with real validation in
+  StateServer callback tests.
 - Production has one named StateServer, with seeded Passenger P001 and initially empty Drivers/Rides/events. Tests inject isolated
   supervised PIDs through trusted `conn.private[:dispatch_store]`; no global
   application-environment mutation or per-request StateServer is used. Seeds
   accept only offline/available Drivers. No live-state test backdoor exists.
 - Accepted [ADR-001](adr/ADR-001-matching.md), [ADR-002](adr/ADR-002-concurrency.md)
-  and [ADR-003](adr/ADR-003-event-processing.md) remain unchanged in #10B. ADR-002's Phase B scope is historical. Single-mailbox
+  and [ADR-003](adr/ADR-003-event-processing.md) remain unchanged in #10B/#11. ADR-002's Phase B scope is historical. Single-mailbox
   contention, scans/sorting, volatile restart loss, single-owner/node limits,
   timeout uncertainty, and stale future ETS projections remain documented limits.
 - Additional evaluation deliverables are incomplete: `README.md` now documents Ride creation, replay and volatile-state limits; full workflow documentation remains incomplete; `architecture.md` and `sequence-diagram.md` are empty. Ride/event

@@ -75,7 +75,7 @@ retrying with the same key is safe while the owner survives. After owner crash o
 restart, keys, Rides and events are lost; a retry can create a new Ride. This is
 not crash-durable idempotency or a durable transactional outbox. One mailbox
 serializes reads/writes, records grow without eviction, and there are no external
-side-effect transactions or multi-node guarantees. Acceptance and broader Offer lifecycle idempotency, release and rematching remain future features. See [AC traceability](docs/ac-traceability.md) for evidence boundaries.
+side-effect transactions or multi-node guarantees. Offer rejection, expiration, cancellation/completion, release and rematching remain future features; acceptance is implemented below. See [AC traceability](docs/ac-traceability.md) for evidence boundaries.
 
 
 ## Asynchronous event processing and reservation (Features #10A/#10B)
@@ -146,7 +146,7 @@ business state unchanged; discovery returns no actionable work until a later sca
 
 A deadline passing does not close a pending Offer or release its Driver. Only a
 future explicit lifecycle command may do so. There is no expiration scheduler,
-acceptance/rejection, cancellation, completion or active rematching yet.
+rejection, cancellation, completion or active rematching yet.
 
 There are no claims, leases, or separate acknowledgements. Event records remain
 in the authoritative `pending_events` map after processing/failure. Attempt count
@@ -185,9 +185,82 @@ terminal/inconsistent state and rejected/expired history; these are explicitly
 separate from live integration evidence. Timeout tests use controlled timeout
 signals before/after real Store processing, rather than an elapsed network timeout.
 
-Feature #10B verification: 165 full-suite tests passed. AC-03, AC-04 and AC-10 are
-VERIFIED against their specified clauses. AC-08 and AC-09 remain PARTIAL: accepted
-Ride lifecycle/idempotency and its concurrency evidence remain future work.
-Pending-offer reservation is proven; no accepted-Ride safety completion is claimed.
-Event, Driver, Ride and history scans contend for one mailbox and retained records
-grow in memory; no throughput, cross-node consistency or durable recovery is promised.
+Feature #10B recorded 165 passing full-suite tests. Event, Driver, Ride and history
+scans contend for one mailbox and retained records grow in memory; no throughput,
+cross-node consistency or durable recovery is promised.
+
+## Offer acceptance (Feature #11)
+
+```sh
+curl -i -X POST http://localhost:4000/rides/{rideId}/offers/{driverId}/accept \
+  -H 'Accept: application/json'
+```
+
+An empty body or `{}` is accepted; no Offer ID or Idempotency-Key is required.
+Unsupported fields, parsed non-object JSON and nonempty unparsed bodies return
+400. Path identifiers select the Ride/Driver; body/query fields cannot override
+them, set owner time, or choose a test StateServer. Driver identity in the URL is
+an ownership selector, not authentication of the network caller.
+
+`Rides.accept_offer(server, ride_id, driver_id)` delegates to
+`Store.accept_offer/3`. It returns `{:ok, original_accepted_ride}`, `:not_found`, or
+`{:error, reason}`. One StateServer callback validates exact `currentOfferId`, map
+identities, Ride/Driver/Offer links and absence of conflicting active ownership,
+checks trusted monotonic processing time, and applies both existing State Machines:
+
+```text
+Ride DRIVER_ACCEPTED + Driver BUSY + Offer ACCEPTED
+assignedDriverId/currentOfferId preserved; no new Offer or Event
+```
+
+First acceptance requires `now_ms < expires_at_ms`. Equality is expired. Failure
+leaves all state unchanged, including the expired-but-unreleased reservation.
+Invalid clock/deadline state produces a controlled error. On success the exact
+Offer retains immutable `accepted_at_ms` and `acceptance_result` (the original
+accepted Ride snapshot). Receipt identity, successful timestamp and immutable Ride
+fields must agree; DRIVER_ACCEPTED/BUSY status alone is insufficient evidence.
+
+HTTP first success and verified replay both return 200 using the existing public
+Ride `data` schema, with `status: "DRIVER_ACCEPTED"` and its `assignedDriverId`.
+Replay returns that original domain result before new-attempt clock/deadline
+checks, changes nothing and never reapplies transitions. GET returns current
+state; POST /rides still replays its original REQUESTED creation result.
+Other responses use the existing `errors.detail` envelope: 400 malformed request,
+404 unknown resources/absent Offer relationship, 409 wrong Driver, expired/stale
+or ambiguous request, and 500 inconsistent ownership/evidence or invalid clock.
+
+The Ride/Driver-only route cannot identify different historical attempts involving
+the same pair. Conservatively, multiple Offers for that pair return
+`:ambiguous_offer` without mutation; history for other Drivers is allowed unless
+it contradicts successful acceptance ownership. This is an approved API policy,
+not an additional challenge requirement. No generic idempotency framework is used.
+
+Future lifecycle commands must retain the receipt when closing an accepted Offer.
+Synthetic callback tests verify replay after COMPLETED/CANCELLED, including cleared
+current identity and a Driver subsequently BUSY on another Ride. These are
+compatibility fixtures, not implemented terminal lifecycle workflows. Stale
+requests without successful evidence conflict; replay never resurrects state.
+Retries after uncertain/lost responses are safe while the owner survives; receipts
+are lost with all other runtime state after owner crash. Tests discard completed
+responses to model loss; no real network-disconnection guarantee is claimed.
+
+Executed verification: 18 acceptance Store tests, 10 HTTP acceptance tests;
+156 focused regressions and **194 full-suite tests passed**. Compilation with
+warnings as errors, formatting and diff checks passed. Run:
+
+```sh
+mix test test/ride_dispatch/dispatch/acceptance_test.exs test/ride_dispatch_web/controllers/offer_acceptance_test.exs test/ride_dispatch/dispatch/reservation_dispatcher_test.exs
+```
+
+Barrier-released duplicate Store and HTTP callers preserve one receipt. Ten live
+two-Ride reservation races continue through acceptance; another Ride cannot take
+the BUSY Driver. Acceptance also competes directly with another Ride's dispatch,
+and real asynchronous dispatcher tests preserve accepted ownership. Final Ride,
+Driver, Offer and Event records are asserted. Redispatch of the original losing
+Ride uses a synthetic new-event fixture: no public redispatch trigger exists.
+
+AC-08's specified creation/acceptance/transition idempotency and AC-09's concurrent
+assignment requirements are VERIFIED with these tests and documented strategies.
+This does not complete AC-02/05/06/07 or prove future reject/expire/cancel/complete
+races; those workflows and their live integration tests remain absent. See
+[AC traceability](docs/ac-traceability.md) for the evidence boundaries.
