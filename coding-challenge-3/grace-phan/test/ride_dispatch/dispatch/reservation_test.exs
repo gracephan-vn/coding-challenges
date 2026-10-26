@@ -176,6 +176,90 @@ defmodule RideDispatch.Dispatch.ReservationTest do
     }
   end
 
+  test "synthetic callback rejects invalid events and Rides without partial business mutation" do
+    {ride, event, state} = fixture()
+
+    variants = [
+      {%{state | rides: %{}}, :ride_not_found},
+      {put_in(state.rides[ride.id].status, :unknown), :invalid_state},
+      {put_in(state.rides[ride.id].status, :requested), :invalid_state},
+      {put_in(state.rides[ride.id].pickup, %{latitude: 91, longitude: 0}), :invalid_pickup},
+      {put_in(state.rides[ride.id], Map.delete(state.rides[ride.id], :pickup)), :invalid_pickup},
+      {put_in(state.pending_events[event.eventId], Map.delete(event, :rideId)), :invalid_event}
+    ]
+
+    for {input, reason} <- variants do
+      assert {:reply, {:error, {:permanent, ^reason}}, final} =
+               StateServer.handle_call({:process_event, event.eventId}, nil, input)
+
+      assert business(final) == business(input)
+      assert final.pending_events[event.eventId].status == :failed
+      assert final.pending_events[event.eventId].last_error == reason
+    end
+  end
+
+  test "synthetic terminal Ride events are ignored without resurrection" do
+    {ride, event, state} = fixture()
+
+    for status <- [:cancelled, :completed] do
+      input = put_in(state.rides[ride.id].status, status)
+
+      assert {:reply, {:ok, :ignored}, final} =
+               StateServer.handle_call({:process_event, event.eventId}, nil, input)
+
+      assert business(final) == business(input)
+      assert final.pending_events[event.eventId].status == :processed
+    end
+  end
+
+  test "synthetic contradictory ownership fails closed even when Driver is AVAILABLE" do
+    {ride, event, state} = fixture()
+    pending = %{id: "existing", rideId: "other", driverId: "D001", status: :pending}
+
+    other =
+      Map.merge(state.rides[ride.id], %{
+        id: "other",
+        status: :driver_assigned,
+        assignedDriverId: "D001",
+        currentOfferId: "existing"
+      })
+
+    variants = [
+      put_in(state.rides[ride.id].assignedDriverId, "D001"),
+      put_in(state.rides[ride.id], Map.put(state.rides[ride.id], :currentOfferId, "dangling")),
+      %{state | offers: %{"existing" => %{pending | rideId: ride.id}}},
+      %{state | offers: %{"existing" => pending}},
+      %{state | offers: %{"existing" => %{pending | status: :accepted}}},
+      %{state | rides: Map.put(state.rides, "other", other)},
+      %{state | rides: Map.put(state.rides, "other", %{other | status: :driver_accepted})}
+    ]
+
+    for input <- variants do
+      assert {:reply, {:error, {:permanent, :inconsistent_ownership}}, final} =
+               StateServer.handle_call({:process_event, event.eventId}, nil, input)
+
+      assert business(final) == business(input)
+      assert final.pending_events[event.eventId].status == :failed
+    end
+  end
+
+  test "replaying the acknowledged reservation leaves every authoritative record unchanged" do
+    server = owner(drivers: [driver("D001", 0)])
+    {_ride, event} = matching(server, "duplicate")
+    assert Store.process_event(server, event.eventId) == {:ok, :processed}
+    before = :sys.get_state(server)
+    assert Store.process_event(server, event.eventId) == {:ok, :already_processed}
+    assert :sys.get_state(server) == before
+  end
+
+  defp fixture do
+    server = owner(drivers: [driver("D001", 0)])
+    {ride, event} = matching(server, "fixture")
+    {ride, event, :sys.get_state(server)}
+  end
+
+  defp business(state), do: Map.take(state, [:rides, :drivers, :offers, :idempotency])
+
   defp driver(id, longitude, status \\ :available) do
     %{id: id, status: status, latitude: 0.0, longitude: longitude, label: "preserve"}
   end
