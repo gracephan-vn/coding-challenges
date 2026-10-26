@@ -48,13 +48,14 @@ defmodule RideDispatch.Dispatch.StateServer do
          :ok <- record_identity(offer, id),
          {:ok, ride} <- expiration_record(state.rides, Map.get(offer, :rideId)),
          {:ok, driver} <- expiration_record(state.drivers, Map.get(offer, :driverId)),
-         :ok <- expiration_pending(ride, driver, offer, state),
+         :ok <- expiration_eligibility(ride, driver, offer, state),
          :ok <- offer_deadline(offer),
          {:ok, now} <- rejection_time(offer, state.clock) do
       if Offer.expired?(offer, now),
         do: expire_pending(ride, driver, offer, now, state),
         else: {:reply, {:error, {:not_due, offer.expires_at_ms}}, state}
     else
+      {:done, outcome} -> {:reply, {:ok, outcome}, state}
       :error -> {:reply, :not_found, state}
       {:error, _} = error -> {:reply, error, state}
     end
@@ -391,6 +392,88 @@ defmodule RideDispatch.Dispatch.StateServer do
        else: {:error, :inconsistent_ownership}
   end
 
+  defp expiration_eligibility(ride, driver, %{status: :pending} = offer, state),
+    do: expiration_pending(ride, driver, offer, state)
+
+  defp expiration_eligibility(ride, _driver, offer, state) do
+    valid_history? = expiration_ride_consistent?(ride, state)
+
+    case offer.status do
+      :expired ->
+        if valid_history? and expiration_receipt?(offer, state) and
+             Map.get(ride, :currentOfferId) != offer.id,
+           do: {:done, :already_expired},
+           else: {:error, :inconsistent_ownership}
+
+      :accepted ->
+        if valid_history? and acceptance_receipt?(offer, ride) and
+             Map.get(ride, :currentOfferId) == offer.id and ride.status == :driver_accepted,
+           do: {:done, :ignored},
+           else: {:error, :inconsistent_ownership}
+
+      :rejected ->
+        if valid_history? and rejection_receipt?(offer, ride, state) and
+             Map.get(ride, :currentOfferId) != offer.id,
+           do: {:done, :ignored},
+           else: {:error, :inconsistent_ownership}
+
+      _ ->
+        {:error, :inconsistent_ownership}
+    end
+  end
+
+  defp expiration_receipt?(%{status: :expired, expiration_receipt: receipt} = offer, state)
+       when is_map(receipt) do
+    id = "redispatch-expired-" <> offer.id
+    event = Map.get(state.pending_events, id)
+    at = Map.get(receipt, :expired_at_ms)
+
+    offer_deadline(offer) == :ok and is_integer(at) and at >= offer.expires_at_ms and
+      not Enum.any?(
+        [:accepted_at_ms, :acceptance_result, :rejection_receipt],
+        &Map.has_key?(offer, &1)
+      ) and
+      Map.get(receipt, :offerId) == offer.id and Map.get(receipt, :rideId) == offer.rideId and
+      Map.get(receipt, :driverId) == offer.driverId and
+      Map.get(receipt, :redispatch_event_id) == id and
+      is_map(event) and Map.get(event, :eventId) == id and Map.get(event, :rideId) == offer.rideId and
+      Map.get(event, :type) == :dispatch_requested and
+      Map.get(event, :status) in [:pending, :processed, :failed]
+  end
+
+  defp expiration_receipt?(_offer, _state), do: false
+
+  defp expiration_ride_consistent?(%{status: status} = ride, state)
+       when status in [:matching, :completed, :cancelled] do
+    no_active? =
+      not Enum.any?(state.offers, fn {_, offer} ->
+        is_map(offer) and Map.get(offer, :rideId) == ride.id and
+          Map.get(offer, :status) not in [:rejected, :expired, :cancelled, :completed]
+      end)
+
+    no_active? and current_offer_link(ride, state) == :ok and
+      ((is_nil(Map.get(ride, :currentOfferId)) and is_nil(Map.get(ride, :assignedDriverId))) or
+         (status in [:completed, :cancelled] and
+            Map.get(state.offers[ride.currentOfferId], :status) == status))
+  end
+
+  defp expiration_ride_consistent?(%{status: status} = ride, state)
+       when status in [:driver_assigned, :driver_accepted] do
+    with :ok <- current_offer_link(ride, state),
+         {:ok, offer} <- expiration_record(state.offers, Map.get(ride, :currentOfferId)),
+         {:ok, driver} <- expiration_record(state.drivers, Map.get(ride, :assignedDriverId)) do
+      {status, driver.status, offer.status} in [
+        {:driver_assigned, :offered, :pending},
+        {:driver_accepted, :busy, :accepted}
+      ] and
+        expiration_unique?(ride, driver, offer, state)
+    else
+      _ -> false
+    end
+  end
+
+  defp expiration_ride_consistent?(_ride, _state), do: false
+
   # Unrelated malformed records are diagnosed by scheduling discovery. Records
   # referencing this Ride/Driver must still prove exclusive ownership.
   defp expiration_unique?(ride, driver, offer, state) do
@@ -481,6 +564,7 @@ defmodule RideDispatch.Dispatch.StateServer do
                     {:error, :inconsistent_ownership}
 
                   Map.has_key?(offer, :accepted_at_ms) or Map.has_key?(offer, :acceptance_result) or
+                    Map.has_key?(offer, :expiration_receipt) or
                     Map.has_key?(offer, :rejection_receipt) or
                       Map.has_key?(state.pending_events, "redispatch-" <> offer.id) ->
                     {:error, :inconsistent_ownership}
@@ -565,6 +649,7 @@ defmodule RideDispatch.Dispatch.StateServer do
     at = Map.get(receipt, :rejected_at_ms)
 
     offer_deadline(offer) == :ok and is_integer(at) and at >= offer.created_at_ms and
+      not Map.has_key?(offer, :expiration_receipt) and
       not Map.has_key?(offer, :accepted_at_ms) and not Map.has_key?(offer, :acceptance_result) and
       Map.get(receipt, :offerId) == offer.id and Map.get(receipt, :rideId) == offer.rideId and
       Map.get(receipt, :driverId) == offer.driverId and
@@ -659,7 +744,7 @@ defmodule RideDispatch.Dispatch.StateServer do
       offer.driverId != driver.id ->
         {:error, :wrong_driver}
 
-      not consistent_assignment?(ride, state) ->
+      Map.has_key?(offer, :expiration_receipt) or not consistent_assignment?(ride, state) ->
         {:error, :inconsistent_ownership}
 
       true ->
@@ -731,6 +816,7 @@ defmodule RideDispatch.Dispatch.StateServer do
     immutable_fields = [:id, :passengerId, :pickup, :destination]
 
     offer_deadline(offer) == :ok and at >= offer.created_at_ms and at < offer.expires_at_ms and
+      not Map.has_key?(offer, :expiration_receipt) and not Map.has_key?(offer, :rejection_receipt) and
       Map.get(result, :id) == offer.rideId and Map.get(result, :status) == :driver_accepted and
       Map.get(result, :currentOfferId) == offer.id and
       Map.get(result, :assignedDriverId) == offer.driverId and
