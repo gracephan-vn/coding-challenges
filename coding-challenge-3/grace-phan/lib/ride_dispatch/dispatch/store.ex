@@ -41,7 +41,7 @@ defmodule RideDispatch.Dispatch.Store do
   authoritative state to reserve one pending Offer or record a no-candidate result.
   Reservation coordinates Ride, Driver, Offer and Event; it does not accept a ride.
   Returns `{:ok, :processed | :already_processed | :ignored}`, `:not_found`,
-  or `{:error, :unsupported_event | :failed | {:retry_at, time} | {:permanent, reason}}`.
+  or `{:error, :unsupported_event | :failed | :invalid_clock | {:retry_at, time} | {:permanent, reason}}`.
   Unsupported work is never consumed. Duplicate commands leave state unchanged.
   """
   def process_event(server, id), do: GenServer.call(server, {:process_event, id})

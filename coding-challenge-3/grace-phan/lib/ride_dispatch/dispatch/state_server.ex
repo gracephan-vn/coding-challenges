@@ -197,7 +197,7 @@ defmodule RideDispatch.Dispatch.StateServer do
             {:reply, {:error, :unsupported_event}, state}
 
           not valid_event?(event, id) ->
-            permanent_failure(state, event, :invalid_event)
+            permanent_failure(state, Map.put(event, :eventId, id), :invalid_event)
 
           true ->
             with {:ok, now} <- read_clock(state.clock) do
@@ -348,7 +348,8 @@ defmodule RideDispatch.Dispatch.StateServer do
            excluded_driver_ids: exclusions
          ) do
       {:ok, driver} ->
-        if Enum.any?(active_offers(state), &(&1.driverId == driver.id)) or
+        if Map.get(state.drivers, driver.id) != driver or
+             Enum.any?(active_offers(state), &(&1.driverId == driver.id)) or
              Enum.any?(active_rides(state), &(&1.assignedDriverId == driver.id)) do
           permanent_failure(state, event, :inconsistent_ownership)
         else
@@ -431,7 +432,7 @@ defmodule RideDispatch.Dispatch.StateServer do
     failed =
       Map.merge(event, %{
         status: :failed,
-        attempts: Map.get(event, :attempts, 0) + 1,
+        attempts: event_attempts(event) + 1,
         last_error: reason,
         next_attempt_at: nil
       })
@@ -454,10 +455,20 @@ defmodule RideDispatch.Dispatch.StateServer do
   defp supported_pending?(event),
     do: event.type in [:ride_created, :dispatch_requested] and event.status == :pending
 
-  defp valid_event?(%{eventId: id, rideId: ride_id}, id),
-    do: is_binary(ride_id) and ride_id != ""
+  defp valid_event?(%{eventId: id, rideId: ride_id} = event, id) do
+    attempts = Map.get(event, :attempts, 0)
+    at = Map.get(event, :next_attempt_at)
+
+    is_binary(ride_id) and ride_id != "" and is_integer(attempts) and attempts >= 0 and
+      (is_nil(at) or is_integer(at))
+  end
 
   defp valid_event?(_event, _id), do: false
+
+  defp event_attempts(%{attempts: attempts}) when is_integer(attempts) and attempts >= 0,
+    do: attempts
+
+  defp event_attempts(_event), do: 0
 
   defp eligible?(event, now),
     do: is_nil(Map.get(event, :next_attempt_at)) or event.next_attempt_at <= now
