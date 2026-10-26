@@ -181,6 +181,106 @@ defmodule RideDispatch.Dispatch.StoreTest do
     assert final in expected
   end
 
+  test "availability commands enable and disable while preserving all other fields" do
+    original = %{driver("D001") | status: :offline}
+    server = start_store([original])
+    available = %{original | status: :available}
+
+    assert Store.set_driver_availability(server, original.id, true) == {:ok, available}
+    assert Store.get_driver(server, original.id) == {:ok, available}
+    assert Store.list_available_drivers(server) == [available]
+    assert Store.set_driver_availability(server, original.id, false) == {:ok, original}
+    assert Store.get_driver(server, original.id) == {:ok, original}
+    assert Store.list_available_drivers(server) == []
+  end
+
+  test "repeated availability requests succeed unchanged" do
+    for {status, available?} <- [offline: false, available: true] do
+      original = %{driver("D001") | status: status}
+      server = start_store([original])
+      assert Store.set_driver_availability(server, original.id, available?) == {:ok, original}
+      assert Store.set_driver_availability(server, original.id, available?) == {:ok, original}
+      assert Store.get_driver(server, original.id) == {:ok, original}
+    end
+  end
+
+  test "availability commands return not_found for unknown IDs" do
+    server = start_store([])
+
+    for available? <- [true, false] do
+      assert Store.set_driver_availability(server, "missing", available?) == :not_found
+    end
+
+    assert Store.list_available_drivers(server) == []
+  end
+
+  test "availability callback rejects offered and busy drivers without changing state" do
+    # These states cannot be seeded or reached through current Store commands.
+    # Exercise the callback with values, without mutating any live StateServer.
+    for status <- [:offered, :busy], available? <- [true, false] do
+      original = %{driver("D001") | status: status}
+      state = %{drivers: %{original.id => original}}
+
+      assert StateServer.handle_call(
+               {:set_driver_availability, original.id, available?},
+               {self(), make_ref()},
+               state
+             ) == {:reply, {:error, :invalid_transition}, state}
+    end
+  end
+
+  test "availability callback propagates the State Machine invalid-state result" do
+    original = %{driver("D001") | status: :unknown}
+    state = %{drivers: %{original.id => original}}
+
+    assert StateServer.handle_call(
+             {:set_driver_availability, original.id, true},
+             {self(), make_ref()},
+             state
+           ) == {:reply, {:error, :invalid_state}, state}
+  end
+
+  test "competing enable and disable requests allow either serialization order" do
+    original = %{driver("D001") | status: :offline}
+    server = start_store([original])
+    available = %{original | status: :available}
+
+    results =
+      compete([
+        fn -> Store.set_driver_availability(server, original.id, true) end,
+        fn -> Store.set_driver_availability(server, original.id, false) end
+      ])
+
+    assert results == [{:ok, available}, {:ok, original}]
+    assert {:ok, final} = Store.get_driver(server, original.id)
+    assert final in [original, available]
+
+    assert Store.list_available_drivers(server) ==
+             if(final.status == :available, do: [final], else: [])
+  end
+
+  test "competing availability and location commands have a complete serial history" do
+    original = %{driver("D001") | status: :offline}
+    server = start_store([original])
+    location = %{latitude: 1, longitude: 2}
+    enabled = %{original | status: :available}
+    moved = Map.merge(original, location)
+    final = %{moved | status: :available}
+
+    results =
+      compete([
+        fn -> Store.set_driver_availability(server, original.id, true) end,
+        fn -> Store.update_driver_location(server, original.id, location) end
+      ])
+
+    assert results in [
+             [{:ok, enabled}, {:ok, final}],
+             [{:ok, final}, {:ok, moved}]
+           ]
+
+    assert Store.get_driver(server, original.id) == {:ok, final}
+  end
+
   defp compete(functions) do
     parent = self()
     gate = make_ref()
