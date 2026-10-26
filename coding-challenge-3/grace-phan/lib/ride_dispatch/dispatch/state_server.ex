@@ -42,6 +42,22 @@ defmodule RideDispatch.Dispatch.StateServer do
   end
 
   @impl true
+  def handle_call({:reject_offer, ride_id, driver_id}, _from, state) do
+    with :ok <- acceptance_identifiers(ride_id, driver_id),
+         {:ok, ride} <- Map.fetch(state.rides, ride_id),
+         {:ok, driver} <- Map.fetch(state.drivers, driver_id),
+         :ok <- record_identity(ride, ride_id),
+         :ok <- record_identity(driver, driver_id),
+         :ok <- current_offer_link(ride, state),
+         {:ok, offer} <- Map.fetch(state.offers, Map.get(ride, :currentOfferId)),
+         :ok <- record_identity(offer, ride.currentOfferId) do
+      reject_pending(ride, driver, offer, state)
+    else
+      :error -> {:reply, :not_found, state}
+      {:error, _reason} = error -> {:reply, error, state}
+    end
+  end
+
   def handle_call({:accept_offer, ride_id, driver_id}, _from, state) do
     with :ok <- acceptance_identifiers(ride_id, driver_id),
          {:ok, ride} <- Map.fetch(state.rides, ride_id),
@@ -297,6 +313,44 @@ defmodule RideDispatch.Dispatch.StateServer do
     if Enum.all?([ride_id, driver_id], &(is_binary(&1) and &1 != "" and String.valid?(&1))),
       do: :ok,
       else: {:error, :invalid_request}
+  end
+
+  defp reject_pending(ride, driver, offer, state) do
+    with true <- offer.driverId == driver.id,
+         true <- consistent_assignment?(ride, state),
+         :ok <- offer_deadline(offer),
+         {:ok, now} <- read_clock(state.clock),
+         true <- now >= offer.created_at_ms,
+         {:ok, matching} <- RideStateMachine.transition(ride, :reject_offer),
+         {:ok, available} <- StateMachine.transition(driver, :reject_offer) do
+      matching = Map.merge(matching, %{assignedDriverId: nil, currentOfferId: nil})
+      event_id = "redispatch-" <> offer.id
+
+      receipt = %{
+        offerId: offer.id,
+        rideId: ride.id,
+        driverId: driver.id,
+        rejected_at_ms: now,
+        redispatch_event_id: event_id,
+        original_result: matching
+      }
+
+      rejected = Map.merge(offer, %{status: :rejected, rejection_receipt: receipt})
+      event = %{eventId: event_id, rideId: ride.id, type: :dispatch_requested, status: :pending}
+
+      updated = %{
+        state
+        | rides: Map.put(state.rides, ride.id, matching),
+          drivers: Map.put(state.drivers, driver.id, available),
+          offers: Map.put(state.offers, offer.id, rejected),
+          pending_events: Map.put(state.pending_events, event_id, event)
+      }
+
+      {:reply, {:ok, matching}, updated}
+    else
+      false -> {:reply, {:error, :inconsistent_ownership}, state}
+      {:error, _reason} = error -> {:reply, error, state}
+    end
   end
 
   defp record_identity(%{id: id, status: _status}, id), do: :ok

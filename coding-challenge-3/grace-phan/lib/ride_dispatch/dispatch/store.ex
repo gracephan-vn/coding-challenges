@@ -33,6 +33,20 @@ defmodule RideDispatch.Dispatch.Store do
 
   # Commands
   @doc """
+  Atomically reject the exact current pending Offer, release its Driver and
+  enqueue one Offer-derived redispatch event. Returns `{:ok, original_matching_ride}`,
+  `:not_found`, or `{:error, reason}` using acceptance's identity/error conventions.
+  Late rejection is allowed while the reservation is still pending. Proven receipt
+  replay never releases a replacement assignment or enqueues again. Wake-ups are
+  hints sent after the command; state and receipts are volatile, not durable.
+  """
+  def reject_offer(server, ride_id, driver_id) do
+    result = GenServer.call(server, {:reject_offer, ride_id, driver_id})
+    if match?({:ok, _}, result), do: GenServer.cast(server, :notify_events)
+    result
+  end
+
+  @doc """
   Atomically accept the exact current pending Offer using owner time. No key or
   caller timestamp is needed. Returns `{:ok, original_accepted_ride}` or
   `:not_found` for unknown resources/absent relationship. Validated receipt replay
