@@ -1,4 +1,14 @@
 defmodule RideDispatchWeb.DriverController do
+  @moduledoc """
+  Driver JSON updates using body fields `available` or `latitude`/`longitude`.
+
+  Successful updates return 200 with an explicit public driver under `data`.
+  Store validation errors map to 400, unknown IDs to 404, and state conflicts to
+  409, all using the existing `errors.detail` envelope. Store's unknown-ID
+  precedence is preserved for parsed payloads. Malformed JSON is rejected by
+  the Endpoint parser before any Store call. Extra body fields are ignored.
+  """
+
   use RideDispatchWeb, :controller
 
   alias RideDispatch.Dispatch.{StateServer, Store}
@@ -39,5 +49,14 @@ defmodule RideDispatchWeb.DriverController do
 
   defp respond(conn, :not_found) do
     conn |> put_status(404) |> json(%{errors: %{detail: "Not Found"}})
+  end
+
+  defp respond(conn, {:error, reason})
+       when reason in [:invalid_availability, :invalid_coordinates] do
+    conn |> put_status(400) |> json(%{errors: %{detail: "Bad Request"}})
+  end
+
+  defp respond(conn, {:error, reason}) when reason in [:invalid_transition, :invalid_state] do
+    conn |> put_status(409) |> json(%{errors: %{detail: "Conflict"}})
   end
 end
