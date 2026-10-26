@@ -323,6 +323,9 @@ defmodule RideDispatch.Dispatch.StateServer do
             [{key, offer}] ->
               with :ok <- record_identity(offer, key) do
                 cond do
+                  Map.has_key?(offer, :acceptance_result) or Map.has_key?(offer, :accepted_at_ms) ->
+                    replay_acceptance(ride, offer, state)
+
                   Map.get(offer, :status) in [:rejected, :expired, :cancelled, :completed] ->
                     {:error, :invalid_transition}
 
@@ -382,6 +385,22 @@ defmodule RideDispatch.Dispatch.StateServer do
 
   defp current_acceptance_offer(_ride, _driver, _offer, _state),
     do: {:error, :inconsistent_ownership}
+
+  defp replay_acceptance(ride, offer, state) do
+    active? =
+      Map.get(ride, :status) == :driver_accepted and offer.status == :accepted and
+        Map.get(ride, :currentOfferId) == offer.id and consistent_assignment?(ride, state)
+
+    terminal? =
+      Map.get(ride, :status) in [:completed, :cancelled] and offer.status == ride.status and
+        Map.get(ride, :currentOfferId) in [nil, offer.id] and
+        Map.get(ride, :assignedDriverId) in [nil, offer.driverId] and
+        not Enum.any?(active_offers(state), &(&1.rideId == ride.id))
+
+    if acceptance_receipt?(offer, ride) and (active? or terminal?),
+      do: {:replay, offer.acceptance_result},
+      else: {:error, :inconsistent_ownership}
+  end
 
   defp accept_pending(ride, driver, offer, state) do
     with :ok <- offer_deadline(offer),
