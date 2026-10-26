@@ -292,6 +292,33 @@ defmodule RideDispatch.Dispatch.ReservationDispatcherTest do
     }
   end
 
+  test "asynchronous reservation followed by acceptance keeps BUSY Driver exclusive", %{
+    server: server
+  } do
+    worker = dispatcher(server)
+    assert_receive {:idle, ^worker}, 1000
+    {:ok, ride} = Store.create_ride(server, "accept", body())
+    dispatch = "dispatch-" <> ride.id
+    assert_receive {:result, ^dispatch, {:ok, :processed}, ^worker}, 1000
+    assert {:ok, accepted} = Store.accept_offer(server, ride.id, "D001")
+    [receipt] = Store.list_offers(server)
+    {:ok, other} = Store.create_ride(server, "busy", body())
+    other_dispatch = "dispatch-" <> other.id
+    assert_receive {:result, ^other_dispatch, {:ok, :processed}, ^worker}, 1000
+    assert Store.list_offers(server) == [receipt]
+    assert receipt.status == :accepted and receipt.acceptance_result == accepted
+    assert {:ok, %{status: :busy}} = Store.get_driver(server, "D001")
+    assert Store.get_ride(server, ride.id) == {:ok, accepted}
+    assert {:ok, %{status: :matching, assignedDriverId: nil}} = Store.get_ride(server, other.id)
+
+    assert {:ok, %{status: :processed, outcome: :no_candidate}} =
+             Store.get_event(server, other_dispatch)
+
+    assert Store.accept_offer(server, ride.id, "D001") == {:ok, accepted}
+    assert Store.list_offers(server) == [receipt]
+    assert length(Store.list_events(server)) == 4
+  end
+
   defp pending(server, key) do
     {:ok, ride} = Store.create_ride(server, key, body())
 

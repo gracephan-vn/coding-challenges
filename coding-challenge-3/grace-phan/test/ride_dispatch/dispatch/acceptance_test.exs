@@ -392,4 +392,68 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
       state
     end
   end
+
+  test "AC-09 live competing Rides retain exclusive ownership after acceptance" do
+    for _ <- 1..10 do
+      clock = :atomics.new(1, [])
+      server = owner(fn -> :atomics.get(clock, 1) end)
+      pairs = [matching(server, "A"), matching(server, "B")]
+
+      assert compete(for {_, id} <- pairs, do: fn -> Store.process_event(server, id) end) ==
+               [{:ok, :processed}, {:ok, :processed}]
+
+      assert [pending] = Store.list_offers(server)
+      assert pending.status == :pending and pending.driverId == "D001"
+      {loser, loser_event} = Enum.find(pairs, fn {ride, _} -> ride.id != pending.rideId end)
+      assert {:ok, accepted} = Store.accept_offer(server, pending.rideId, "D001")
+      before_replay = :sys.get_state(server)
+      assert Store.accept_offer(server, pending.rideId, "D001") == {:ok, accepted}
+      assert :sys.get_state(server) == before_replay
+      assert {:ok, %{status: :busy}} = Store.get_driver(server, "D001")
+      assert Store.get_ride(server, pending.rideId) == {:ok, accepted}
+      assert {:ok, waiting} = Store.get_ride(server, loser.id)
+      assert waiting.status == :matching and waiting.assignedDriverId == nil
+      assert Map.get(waiting, :currentOfferId) == nil
+
+      for {ride, event} <- pairs do
+        assert {:ok, %{status: :processed, outcome: outcome}} = Store.get_event(server, event)
+        assert outcome == if(ride.id == pending.rideId, do: :offer_created, else: :no_candidate)
+      end
+
+      {new_ride, new_event} = matching(server, "busy")
+      assert Store.process_event(server, new_event) == {:ok, :processed}
+
+      assert {:ok, %{status: :matching, assignedDriverId: nil}} =
+               Store.get_ride(server, new_ride.id)
+
+      assert [receipt] = Store.list_offers(server)
+      assert receipt.id == pending.id and receipt.status == :accepted
+      assert receipt.acceptance_result == accepted
+
+      assert {:ok, %{outcome: :no_candidate, status: :processed}} =
+               Store.get_event(server, new_event)
+
+      # Replaying an acknowledged event is NOT another matching attempt.
+      assert Store.process_event(server, loser_event) == {:ok, :already_processed}
+      state = :sys.get_state(server)
+      assert map_size(state.rides) == 3 and map_size(state.pending_events) == 6
+      # Synthetic new event: public redispatch is deliberately not implemented.
+      event = %{
+        eventId: "later-attempt",
+        rideId: loser.id,
+        type: :dispatch_requested,
+        status: :pending
+      }
+
+      input = put_in(state.pending_events[event.eventId], event)
+
+      assert {:reply, {:ok, :processed}, final} =
+               StateServer.handle_call({:process_event, event.eventId}, nil, input)
+
+      assert Map.take(final, [:rides, :drivers, :offers, :idempotency]) ==
+               Map.take(input, [:rides, :drivers, :offers, :idempotency])
+
+      assert final.pending_events[event.eventId].outcome == :no_candidate
+    end
+  end
 end
