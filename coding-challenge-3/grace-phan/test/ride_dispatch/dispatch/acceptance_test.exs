@@ -22,6 +22,52 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
     assert Store.create_ride(server, "ride", body()) == {:ok, ride}
   end
 
+  test "invalid identifiers, unknown resources and wrong Driver leave all state unchanged" do
+    {server, ride, _offer, _clock} = reserved()
+    before = :sys.get_state(server)
+
+    for invalid <- [nil, 0, [], <<255>>, ""] do
+      assert Store.accept_offer(server, invalid, "D001") == {:error, :invalid_request}
+      assert Store.accept_offer(server, ride.id, invalid) == {:error, :invalid_request}
+    end
+
+    assert Store.accept_offer(server, "missing", "D001") == :not_found
+    assert Store.accept_offer(server, ride.id, "missing") == :not_found
+    assert Store.accept_offer(server, ride.id, "D002") == {:error, :wrong_driver}
+    assert :sys.get_state(server) == before
+    {unassigned, _} = matching(server, "no-offer")
+    before = :sys.get_state(server)
+    assert Store.accept_offer(server, unassigned.id, "D001") == :not_found
+    assert :sys.get_state(server) == before
+  end
+
+  test "synthetic ownership contradictions fail without installing any partial transition" do
+    {server, ride, offer, _} = reserved()
+    state = :sys.get_state(server)
+    duplicate_ride = %{state.rides[ride.id] | id: "other"}
+    duplicate_offer = %{offer | id: "other", rideId: "other"}
+
+    variants = [
+      put_in(state.rides[ride.id].id, "wrong"),
+      put_in(state.drivers["D001"].id, "wrong"),
+      put_in(state.rides[ride.id].assignedDriverId, "D002"),
+      put_in(state.rides[ride.id].currentOfferId, nil),
+      put_in(state.rides[ride.id].currentOfferId, "missing"),
+      put_in(state.offers[offer.id].id, "wrong"),
+      put_in(state.offers[offer.id].rideId, "wrong"),
+      put_in(state.offers[offer.id].driverId, "D002"),
+      put_in(state.offers[offer.id], %{}),
+      put_in(state.drivers["D001"].status, :available),
+      %{state | rides: Map.put(state.rides, "other", duplicate_ride)},
+      %{state | offers: Map.put(state.offers, "other", %{duplicate_offer | status: :accepted})}
+    ]
+
+    for input <- variants do
+      assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+               StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+    end
+  end
+
   defp body do
     %{
       "passengerId" => "P001",
