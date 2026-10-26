@@ -46,6 +46,77 @@ defmodule RideDispatch.Dispatch.RejectionTest do
     assert Store.create_ride(server, "original", body()) == {:ok, ride}
   end
 
+  test "invalid identifiers, unknown resources and wrong holder never mutate state" do
+    {server, ride, _, _} = reserved()
+    before = :sys.get_state(server)
+
+    for invalid <- [nil, 0, [], "", <<255>>] do
+      assert Store.reject_offer(server, invalid, "A") == {:error, :invalid_request}
+      assert Store.reject_offer(server, ride.id, invalid) == {:error, :invalid_request}
+    end
+
+    assert Store.reject_offer(server, "missing", "A") == :not_found
+    assert Store.reject_offer(server, ride.id, "missing") == :not_found
+    assert Store.reject_offer(server, ride.id, "B") == {:error, :wrong_driver}
+    assert :sys.get_state(server) == before
+  end
+
+  test "synthetic contradictory ownership, evidence and event collisions are rejected atomically" do
+    {server, ride, offer, _} = reserved()
+    state = :sys.get_state(server)
+
+    variants = [
+      put_in(state.rides[ride.id].id, "wrong"),
+      put_in(state.drivers["A"].id, "wrong"),
+      put_in(state.rides[ride.id].currentOfferId, nil),
+      put_in(state.rides[ride.id].currentOfferId, "missing"),
+      put_in(state.offers[offer.id].id, "wrong"),
+      put_in(state.offers[offer.id].rideId, "wrong"),
+      put_in(state.offers[offer.id].driverId, "B"),
+      put_in(state.offers[offer.id].status, :rejected),
+      put_in(state.offers[offer.id].expires_at_ms, nil),
+      put_in(state.drivers["A"].status, :busy),
+      put_in(state.offers[offer.id], Map.put(offer, :accepted_at_ms, 0)),
+      put_in(state.offers[offer.id], Map.put(offer, :acceptance_result, %{})),
+      put_in(state.offers[offer.id], Map.put(offer, :rejection_receipt, %{})),
+      put_in(state.pending_events["redispatch-" <> offer.id], %{eventId: "collision"}),
+      put_in(state.offers["other"], %{offer | id: "other", driverId: "B", status: :accepted}),
+      put_in(state.rides["other"], %{state.rides[ride.id] | id: "other"})
+    ]
+
+    for input <- variants do
+      assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+               StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
+    end
+  end
+
+  test "late rejection explicitly releases a still pending reservation; invalid time cannot" do
+    for offset <- [0, 1] do
+      {server, ride, offer, clock} = reserved()
+      :atomics.put(clock, 1, offer.expires_at_ms + offset)
+      assert {:ok, %{status: :matching}} = Store.reject_offer(server, ride.id, "A")
+      assert {:ok, %{status: :available}} = Store.get_driver(server, "A")
+    end
+
+    {server, ride, _, _} = reserved()
+    state = :sys.get_state(server)
+
+    for clock <- [fn -> nil end, fn -> raise "clock" end, fn -> -1 end] do
+      input = %{state | clock: clock}
+
+      assert {:reply, {:error, :invalid_clock}, ^input} =
+               StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
+    end
+  end
+
+  test "accepted Offers conflict rather than release BUSY ownership" do
+    {server, ride, _, _} = reserved()
+    assert {:ok, _} = Store.accept_offer(server, ride.id, "A")
+    state = :sys.get_state(server)
+    assert Store.reject_offer(server, ride.id, "A") == {:error, :invalid_transition}
+    assert :sys.get_state(server) == state
+  end
+
   defp reserved do
     clock = :atomics.new(1, [])
 

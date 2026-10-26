@@ -48,12 +48,11 @@ defmodule RideDispatch.Dispatch.StateServer do
          {:ok, driver} <- Map.fetch(state.drivers, driver_id),
          :ok <- record_identity(ride, ride_id),
          :ok <- record_identity(driver, driver_id),
-         :ok <- current_offer_link(ride, state),
-         {:ok, offer} <- Map.fetch(state.offers, Map.get(ride, :currentOfferId)),
-         :ok <- record_identity(offer, ride.currentOfferId) do
+         {:ok, offer} <- resolve_rejection_offer(ride, driver, state) do
       reject_pending(ride, driver, offer, state)
     else
       :error -> {:reply, :not_found, state}
+      :not_found -> {:reply, :not_found, state}
       {:error, _reason} = error -> {:reply, error, state}
     end
   end
@@ -316,11 +315,8 @@ defmodule RideDispatch.Dispatch.StateServer do
   end
 
   defp reject_pending(ride, driver, offer, state) do
-    with true <- offer.driverId == driver.id,
-         true <- consistent_assignment?(ride, state),
-         :ok <- offer_deadline(offer),
-         {:ok, now} <- read_clock(state.clock),
-         true <- now >= offer.created_at_ms,
+    with :ok <- offer_deadline(offer),
+         {:ok, now} <- rejection_time(offer, state.clock),
          {:ok, matching} <- RideStateMachine.transition(ride, :reject_offer),
          {:ok, available} <- StateMachine.transition(driver, :reject_offer) do
       matching = Map.merge(matching, %{assignedDriverId: nil, currentOfferId: nil})
@@ -348,8 +344,57 @@ defmodule RideDispatch.Dispatch.StateServer do
 
       {:reply, {:ok, matching}, updated}
     else
-      false -> {:reply, {:error, :inconsistent_ownership}, state}
       {:error, _reason} = error -> {:reply, error, state}
+    end
+  end
+
+  defp resolve_rejection_offer(ride, driver, state) do
+    history =
+      for {key, %{rideId: ride_id, driverId: driver_id} = offer} <- state.offers,
+          ride_id == ride.id and driver_id == driver.id,
+          do: {key, offer}
+
+    case history do
+      [_, _ | _] ->
+        {:error, :ambiguous_offer}
+
+      _ ->
+        with :ok <- current_offer_link(ride, state) do
+          case history do
+            [] ->
+              if is_nil(Map.get(ride, :currentOfferId)),
+                do: :not_found,
+                else: {:error, :wrong_driver}
+
+            [{key, offer}] ->
+              with :ok <- record_identity(offer, key) do
+                cond do
+                  offer.id != Map.get(ride, :currentOfferId) ->
+                    {:error, :invalid_transition}
+
+                  offer.status == :accepted ->
+                    {:error, :invalid_transition}
+
+                  offer.status != :pending or not consistent_assignment?(ride, state) ->
+                    {:error, :inconsistent_ownership}
+
+                  Map.has_key?(offer, :accepted_at_ms) or Map.has_key?(offer, :acceptance_result) or
+                    Map.has_key?(offer, :rejection_receipt) or
+                      Map.has_key?(state.pending_events, "redispatch-" <> offer.id) ->
+                    {:error, :inconsistent_ownership}
+
+                  true ->
+                    with :ok <- exclusive_acceptance_history(ride, offer, state), do: {:ok, offer}
+                end
+              end
+          end
+        end
+    end
+  end
+
+  defp rejection_time(offer, clock) do
+    with {:ok, now} <- read_clock(clock) do
+      if now >= offer.created_at_ms, do: {:ok, now}, else: {:error, :invalid_clock}
     end
   end
 
