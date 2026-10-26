@@ -258,6 +258,111 @@ defmodule RideDispatch.Dispatch.ReservationTest do
     {ride, event, :sys.get_state(server)}
   end
 
+  test "an expired but unreleased pending Offer still reserves its Driver" do
+    clock = :atomics.new(1, [])
+    server = owner(drivers: [driver("D001", 0)], clock: fn -> :atomics.get(clock, 1) end)
+    {first, first_event} = matching(server, "first")
+    assert Store.process_event(server, first_event.eventId) == {:ok, :processed}
+    [offer] = Store.list_offers(server)
+    :atomics.put(clock, 1, offer.expires_at_ms + 1)
+    {second, second_event} = matching(server, "second")
+    before = :sys.get_state(server)
+    assert Store.process_event(server, second_event.eventId) == {:ok, :processed}
+    assert Store.list_offers(server) == [offer]
+    assert {:ok, %{status: :offered}} = Store.get_driver(server, "D001")
+
+    assert {:ok, %{status: :driver_assigned, assignedDriverId: "D001", currentOfferId: id}} =
+             Store.get_ride(server, first.id)
+
+    assert id == offer.id
+    assert {:ok, waiting} = Store.get_ride(server, second.id)
+    assert waiting.status == :matching and waiting.assignedDriverId == nil
+    assert Map.get(waiting, :currentOfferId) == nil
+
+    assert {:ok, %{status: :processed, outcome: :no_candidate}} =
+             Store.get_event(server, second_event.eventId)
+
+    assert :sys.get_state(server).drivers == before.drivers
+    assert :sys.get_state(server).rides == before.rides
+  end
+
+  test "synthetic distinct dispatch event IDs never replace a consistent current Offer" do
+    {ride, event, state} = fixture()
+    second = %{event | eventId: "second-dispatch"}
+    input = %{state | pending_events: Map.put(state.pending_events, second.eventId, second)}
+
+    for [first, last] <- [[event, second], [second, event]] do
+      assert {:reply, {:ok, :processed}, assigned} =
+               StateServer.handle_call({:process_event, first.eventId}, nil, input)
+
+      assert {:reply, {:ok, :ignored}, final} =
+               StateServer.handle_call({:process_event, last.eventId}, nil, assigned)
+
+      assert business(final) == business(assigned)
+      assert map_size(final.offers) == 1
+      offer = final.offers[final.rides[ride.id].currentOfferId]
+      assert offer.status == :pending and offer.driverId == "D001" and offer.rideId == ride.id
+      assert final.drivers["D001"].status == :offered
+      assert final.rides[ride.id].status == :driver_assigned
+      assert final.rides[ride.id].assignedDriverId == "D001"
+      assert final.pending_events[first.eventId].outcome == :offer_created
+      assert final.pending_events[last.eventId].outcome == :already_assigned
+      assert final.pending_events[first.eventId].status == :processed
+      assert final.pending_events[last.eventId].status == :processed
+    end
+  end
+
+  test "queued work gets its full timeout from authoritative reservation time" do
+    clock = :atomics.new(1, [])
+    :atomics.put(clock, 1, -100_000)
+
+    server =
+      owner(
+        drivers: [driver("D001", 0)],
+        clock: fn -> :atomics.get(clock, 1) end,
+        offer_timeout_ms: 1234
+      )
+
+    {_ride, event} = matching(server, "delayed")
+    :atomics.put(clock, 1, 900_000)
+    assert Store.process_event(server, event.eventId) == {:ok, :processed}
+    assert [offer] = Store.list_offers(server)
+    assert offer.created_at_ms == 900_000
+    assert offer.expires_at_ms == 901_234
+    refute RideDispatch.Dispatch.Offer.expired?(offer, 901_233)
+    assert RideDispatch.Dispatch.Offer.expired?(offer, 901_234)
+    assert RideDispatch.Dispatch.Offer.expired?(offer, 901_235)
+    assert Store.get_offer(server, offer.id) == {:ok, offer}
+  end
+
+  test "invalid runtime clocks reject processing without business mutation or busy-loop eligibility" do
+    clock = :atomics.new(1, [])
+
+    now = fn ->
+      case :atomics.get(clock, 1) do
+        -1 -> nil
+        -2 -> raise "invalid trusted clock"
+        time -> time
+      end
+    end
+
+    server = owner(drivers: [driver("D001", 0)], clock: now)
+    {_ride, event} = matching(server, "clock")
+    before = :sys.get_state(server)
+
+    for invalid <- [-1, -2] do
+      :atomics.put(clock, 1, invalid)
+      assert Store.process_event(server, event.eventId) == {:error, :invalid_clock}
+      assert Store.list_actionable_events(server) == []
+      assert Store.next_event_delay(server) == nil
+
+      assert Store.fail_event(server, event.eventId, 0, :processing_failed) ==
+               {:error, :invalid_clock}
+
+      assert :sys.get_state(server) == before
+    end
+  end
+
   defp business(state), do: Map.take(state, [:rides, :drivers, :offers, :idempotency])
 
   defp driver(id, longitude, status \\ :available) do
