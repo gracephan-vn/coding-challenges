@@ -28,6 +28,52 @@ defmodule RideDispatch.Rides.StateMachineTest do
     end
   end
 
+  for source <- [:requested, :matching, :driver_assigned, :driver_accepted] do
+    test "cancel_ride permits #{source} -> cancelled, preserving other fields" do
+      original = ride(unquote(source))
+
+      assert StateMachine.transition(original, :cancel_ride) ==
+               {:ok, %{original | status: :cancelled}}
+    end
+  end
+
+  test "cancelled and completed are terminal for all supported actions" do
+    for status <- [:cancelled, :completed],
+        action <- [
+          :start_matching,
+          :create_offer,
+          :accept_offer,
+          :reject_offer,
+          :expire_offer,
+          :complete_ride,
+          :cancel_ride
+        ] do
+      assert StateMachine.transition(ride(status), action) == {:error, :invalid_transition}
+    end
+  end
+
+  test "repeating an applied command is rejected without changing the result" do
+    for {source, action} <- [
+          {:requested, :start_matching},
+          {:matching, :create_offer},
+          {:driver_assigned, :accept_offer},
+          {:driver_assigned, :reject_offer},
+          {:driver_assigned, :expire_offer},
+          {:driver_accepted, :complete_ride},
+          {:requested, :cancel_ride},
+          {:matching, :cancel_ride},
+          {:driver_assigned, :cancel_ride},
+          {:driver_accepted, :cancel_ride}
+        ] do
+      original = ride(source)
+      assert {:ok, transitioned} = StateMachine.transition(original, action)
+      snapshot = transitioned
+      assert StateMachine.transition(transitioned, action) == {:error, :invalid_transition}
+      assert transitioned == snapshot
+      assert original == ride(source)
+    end
+  end
+
   defp ride(status) do
     %{
       id: "R001",
