@@ -71,6 +71,103 @@ defmodule RideDispatch.Dispatch.ReservationTest do
     assert Store.list_offers(owner()) == []
   end
 
+  test "matching reads the latest stored location" do
+    server = owner(drivers: [driver("D001", 0.001), driver("D002", 0.01)])
+    {ride, event} = matching(server, "latest")
+    assert {:ok, _} = Store.update_driver_location(server, "D001", %{latitude: 0, longitude: 1})
+    assert Store.process_event(server, event.eventId) == {:ok, :processed}
+    assert {:ok, %{assignedDriverId: "D002"}} = Store.get_ride(server, ride.id)
+    assert {:ok, %{status: :available, longitude: 1}} = Store.get_driver(server, "D001")
+  end
+
+  test "availability updates completed before reservation determine eligibility" do
+    server = owner(drivers: [driver("D001", 0.001), driver("D002", 0.01, :offline)])
+    {ride, event} = matching(server, "availability")
+    assert {:ok, _} = Store.set_driver_availability(server, "D001", false)
+    assert {:ok, _} = Store.set_driver_availability(server, "D002", true)
+    assert Store.process_event(server, event.eventId) == {:ok, :processed}
+    assert {:ok, %{assignedDriverId: "D002"}} = Store.get_ride(server, ride.id)
+    assert {:ok, %{status: :offline}} = Store.get_driver(server, "D001")
+  end
+
+  test "no candidate is processed once without a retry or new work" do
+    for drivers <- [[], [driver("outside", 0.018)], [driver("offline", 0, :offline)]] do
+      server = owner(drivers: drivers)
+      {ride, event} = matching(server, "none")
+      assert Store.process_event(server, event.eventId) == {:ok, :processed}
+      assert {:ok, current} = Store.get_ride(server, ride.id)
+      assert current.status == :matching
+      assert current.assignedDriverId == nil
+      assert Map.get(current, :currentOfferId) == nil
+      assert Store.list_offers(server) == []
+
+      assert {:ok,
+              %{status: :processed, outcome: :no_candidate, attempts: 1, next_attempt_at: nil} =
+                done} =
+               Store.get_event(server, event.eventId)
+
+      refute Map.has_key?(done, :last_error)
+      assert Store.list_actionable_events(server) == []
+      assert Store.next_event_delay(server) == nil
+      assert length(Store.list_events(server)) == 2
+    end
+  end
+
+  test "synthetic callback history excludes rejected/expired Drivers only for that Ride" do
+    server = owner(drivers: [driver("D001", 0.001), driver("D002", 0.002), driver("D003", 0.003)])
+    {ride, event} = matching(server, "history")
+    {other, other_event} = matching(server, "other")
+    state = :sys.get_state(server)
+
+    history = %{
+      "rejected" => %{id: "rejected", rideId: ride.id, driverId: "D001", status: :rejected},
+      "expired" => %{id: "expired", rideId: ride.id, driverId: "D002", status: :expired}
+    }
+
+    fixture = %{state | offers: history}
+
+    assert {:reply, {:ok, :processed}, updated} =
+             StateServer.handle_call({:process_event, event.eventId}, nil, fixture)
+
+    assert updated.rides[ride.id].assignedDriverId == "D003"
+    assert Map.take(updated.offers, Map.keys(history)) == history
+
+    assert {:reply, {:ok, :processed}, final} =
+             StateServer.handle_call({:process_event, other_event.eventId}, nil, updated)
+
+    assert final.rides[other.id].assignedDriverId == "D001"
+
+    exhausted = %{fixture | drivers: Map.take(fixture.drivers, ["D001", "D002"])}
+
+    assert {:reply, {:ok, :processed}, none} =
+             StateServer.handle_call({:process_event, event.eventId}, nil, exhausted)
+
+    assert none.rides[ride.id].status == :matching
+    assert none.offers == history
+    assert none.pending_events[event.eventId].outcome == :no_candidate
+  end
+
+  test "configured inclusive radius and lexicographic ties reuse Matcher semantics" do
+    for drivers <- [
+          [driver("D2", 0.01), driver("D10", 0.01)],
+          [driver("D10", 0.01), driver("D2", 0.01)]
+        ] do
+      radius = RideDispatch.Location.distance_km(%{latitude: 0, longitude: 0}, hd(drivers))
+
+      server =
+        owner(drivers: [driver("outside", 0.010000001) | drivers], matching_radius_km: radius)
+
+      {ride, event} = matching(server, "boundary")
+      assert Store.process_event(server, event.eventId) == {:ok, :processed}
+      assert {:ok, %{assignedDriverId: "D10"}} = Store.get_ride(server, ride.id)
+    end
+
+    server = owner(drivers: [driver("D001", 0.025)], matching_radius_km: 3.0)
+    {ride, event} = matching(server, "custom")
+    assert Store.process_event(server, event.eventId) == {:ok, :processed}
+    assert {:ok, %{assignedDriverId: "D001"}} = Store.get_ride(server, ride.id)
+  end
+
   defp body do
     %{
       "passengerId" => "P001",
