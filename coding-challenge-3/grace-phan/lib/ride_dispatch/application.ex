@@ -18,6 +18,11 @@ defmodule RideDispatch.Application do
        offer_timeout_ms: Application.get_env(:ride_dispatch, :offer_timeout_ms, 30_000)},
       {RideDispatch.Dispatch.EventDispatcher,
        name: RideDispatch.Dispatch.EventDispatcher, store: RideDispatch.Dispatch.StateServer},
+      {RideDispatch.Dispatch.ExpirationScheduler,
+       name: RideDispatch.Dispatch.ExpirationScheduler,
+       store: RideDispatch.Dispatch.StateServer,
+       scan_interval_ms:
+         Application.get_env(:ride_dispatch, :offer_expiration_scan_interval_ms, 1000)},
       # Start to serve requests, typically the last entry
       RideDispatchWeb.Endpoint
     ]
