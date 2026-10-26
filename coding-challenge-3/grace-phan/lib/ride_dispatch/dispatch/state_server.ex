@@ -299,7 +299,7 @@ defmodule RideDispatch.Dispatch.StateServer do
       else: {:error, :invalid_request}
   end
 
-  defp record_identity(%{id: id}, id), do: :ok
+  defp record_identity(%{id: id, status: _status}, id), do: :ok
   defp record_identity(_record, _id), do: {:error, :inconsistent_ownership}
 
   defp resolve_acceptance_offer(ride, driver, state) do
