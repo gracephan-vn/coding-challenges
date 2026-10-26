@@ -1,99 +1,72 @@
-This is a web application written using the Phoenix web framework.
+# Ride-Hailing Dispatch Challenge — Agent Instructions
 
-## Project guidelines
+## Source of truth
+- `docs/challenge-spec.md` is the authoritative challenge specification.
+- Meet all 10 acceptance criteria.
+- `docs/implementation-guide.md` provides the chosen implementation approach.
+- If guidance conflicts with the challenge, follow the challenge and report the conflict.
 
-- Use `mix precommit` alias when you are done with all changes and fix any pending issues
-- Use the already included and available `:req` (`Req`) library for HTTP requests, **avoid** `:httpoison`, `:tesla`, and `:httpc`. Req is included by default and is the preferred HTTP client for Phoenix apps
+## Architecture
+- Elixir + Phoenix, API-only, no Ecto.
+- Modular monolith with Rides, Drivers, and Dispatch boundaries.
+- Functional core for matching, validation, and state transitions.
+- One authoritative GenServer-backed in-memory state owner.
+- Use `Dispatch.Store` as the public state access boundary.
+- Never bypass Store to mutate internal state.
+- Keep queries separate from commands.
+- Multi-entity state changes must be atomic.
+- ETS is a future optimization, not part of the initial implementation.
+- The event bus must support asynchronous dispatch.
+- Document the limitations of volatile in-memory state.
 
-### Phoenix v1.8 guidelines
+## TDD
+- Work in one small behavioral slice at a time.
+- First write a failing test and verify the expected failure.
+- Then implement the smallest correct solution.
+- Refactor without changing behavior and rerun tests.
+- Do not implement future slices unless explicitly requested.
+- Do not claim tests passed unless executed successfully.
 
-- **Always** begin your LiveView templates with `<Layouts.app flash={@flash} ...>` which wraps all inner content
-- The `MyAppWeb.Layouts` module is aliased in the `my_app_web.ex` file, so you can use it without needing to alias it again
-- Anytime you run into errors with no `current_scope` assign:
-  - You failed to follow the Authenticated Routes guidelines, or you failed to pass `current_scope` to `<Layouts.app>`
-  - **Always** fix the `current_scope` error by moving your routes to the proper `live_session` and ensure you pass `current_scope` as needed
-- Phoenix v1.8 moved the `<.flash_group>` component to the `Layouts` module. You are **forbidden** from calling `<.flash_group>` outside of the `layouts.ex` module
-- Out of the box, `core_components.ex` imports an `<.icon name="hero-x-mark" class="w-5 h-5"/>` component for hero icons. **Always** use the `<.icon>` component for icons, **never** use `Heroicons` modules or similar
-- **Always** use the imported `<.input>` component for form inputs from `core_components.ex` when available. `<.input>` is imported and using it will save steps and prevent errors
-- If you override the default input classes (`<.input class="myclass px-2 py-1 rounded-lg">)`) class with your own values, no default classes are inherited, so your
-custom classes must fully style the input
+## Git
+- Preserve the competition branch naming convention.
+- Never force-push, reset hard, rebase, squash, merge, or open a PR without explicit approval.
+- Local commits are permitted only when explicitly authorized by the current task. Push, history rewrites and destructive Git operations always require separate approval.
+- Show proposed Git commands and explain their effects.
+- Preserve visible Red-Green-Refactor commit history.
+- Never commit secrets or generated dependencies.
 
+## Engineering
+- Prefer idiomatic Elixir, OTP, and Phoenix conventions.
+- Keep controllers thin.
+- Enforce invariants at the authoritative state owner.
+- Avoid premature abstractions and unnecessary dependencies.
+- Make time-dependent behavior deterministic in tests.
+- Test concurrent behavior with actual competing processes.
+- For architectural changes, explain the rationale, alternatives, and trade-offs.
 
-<!-- usage-rules-start -->
+## Project consistency
+Before declaring a feature complete:
 
-<!-- phoenix:elixir-start -->
-## Elixir guidelines
+- Compare affected public contracts with `docs/challenge-spec.md` and verify relevant code and tests.
+- Update only affected documentation and `docs/ac-traceability.md`; distinguish implemented behavior from plans.
+- Report discrepancies instead of silently changing accepted architectural decisions.
+- Inspect the Git diff and preserve unrelated working-tree changes.
 
-- Elixir lists **do not support index based access via the access syntax**
+## Efficiency
+- Inspect only files relevant to the active task.
+- Do not repeatedly reread the entire specification.
+- Run focused tests during TDD; run the full suite at appropriate checkpoints.
+- Avoid unnecessary web searches, package installations, and tool calls.
+- Keep responses concise and report only relevant results.
 
-  **Never do this (invalid)**:
+## Output for each completed slice
+1. Behavior addressed and AC reference.
+2. RED test and observed failure.
+3. GREEN implementation and test result.
+4. Refactor and verification.
+5. Files changed.
+6. Architecture rationale and trade-offs, if applicable.
+7. Suggested Git commits.
+8. One recommended next slice.
 
-      i = 0
-      mylist = ["blue", "green"]
-      mylist[i]
-
-  Instead, **always** use `Enum.at`, pattern matching, or `List` for index based list access, ie:
-
-      i = 0
-      mylist = ["blue", "green"]
-      Enum.at(mylist, i)
-
-- Elixir variables are immutable, but can be rebound, so for block expressions like `if`, `case`, `cond`, etc
-  you *must* bind the result of the expression to a variable if you want to use it and you CANNOT rebind the result inside the expression, ie:
-
-      # INVALID: we are rebinding inside the `if` and the result never gets assigned
-      if connected?(socket) do
-        socket = assign(socket, :val, val)
-      end
-
-      # VALID: we rebind the result of the `if` to a new variable
-      socket =
-        if connected?(socket) do
-          assign(socket, :val, val)
-        end
-
-- **Never** nest multiple modules in the same file as it can cause cyclic dependencies and compilation errors
-- **Never** use map access syntax (`changeset[:field]`) on structs as they do not implement the Access behaviour by default. For regular structs, you **must** access the fields directly, such as `my_struct.field` or use higher level APIs that are available on the struct if they exist, `Ecto.Changeset.get_field/2` for changesets
-- Elixir's standard library has everything necessary for date and time manipulation. Familiarize yourself with the common `Time`, `Date`, `DateTime`, and `Calendar` interfaces by accessing their documentation as necessary. **Never** install additional dependencies unless asked or for date/time parsing (which you can use the `date_time_parser` package)
-- Don't use `String.to_atom/1` on user input (memory leak risk)
-- Predicate function names should not start with `is_` and should end in a question mark. Names like `is_thing` should be reserved for guards
-- Elixir's builtin OTP primitives like `DynamicSupervisor` and `Registry`, require names in the child spec, such as `{DynamicSupervisor, name: MyApp.MyDynamicSup}`, then you can use `DynamicSupervisor.start_child(MyApp.MyDynamicSup, child_spec)`
-- Use `Task.async_stream(collection, callback, options)` for concurrent enumeration with back-pressure. The majority of times you will want to pass `timeout: :infinity` as option
-
-## Mix guidelines
-
-- Read the docs and options before using tasks (by using `mix help task_name`)
-- To debug test failures, run tests in a specific file with `mix test test/my_test.exs` or run all previously failed tests with `mix test --failed`
-- `mix deps.clean --all` is **almost never needed**. **Avoid** using it unless you have good reason
-
-## Test guidelines
-
-- **Always use `start_supervised!/1`** to start processes in tests as it guarantees cleanup between tests
-- **Avoid** `Process.sleep/1` and `Process.alive?/1` in tests
-  - Instead of sleeping to wait for a process to finish, **always** use `Process.monitor/1` and assert on the DOWN message:
-
-      ref = Process.monitor(pid)
-      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
-
-   - Instead of sleeping to synchronize before the next call, **always** use `_ = :sys.get_state/1` to ensure the process has handled prior messages
-<!-- phoenix:elixir-end -->
-
-<!-- phoenix:phoenix-start -->
-## Phoenix guidelines
-
-- Remember Phoenix router `scope` blocks include an optional alias which is prefixed for all routes within the scope. **Always** be mindful of this when creating routes within a scope to avoid duplicate module prefixes.
-
-- You **never** need to create your own `alias` for route definitions! The `scope` provides the alias, ie:
-
-      scope "/admin", AppWeb.Admin do
-        pipe_through :browser
-
-        live "/users", UserLive, :index
-      end
-
-  the UserLive route would point to the `AppWeb.Admin.UserLive` module
-
-- `Phoenix.View` no longer is needed or included with Phoenix, don't use it
-<!-- phoenix:phoenix-end -->
-
-<!-- usage-rules-end -->
+Complete one explicitly assigned behavior group using multiple Red–Green–Refactor cycles. Preserve test-first evidence in Git history. Stop after the behavior group is complete. Never proceed to an unrelated feature.
