@@ -5,7 +5,10 @@ defmodule RideDispatchWeb.Router do
     plug :accepts, ["json"]
   end
 
-  scope "/api", RideDispatchWeb do
+  scope "/", RideDispatchWeb do
     pipe_through :api
+
+    put "/drivers/:id/availability", DriverController, :availability
+    put "/drivers/:id/location", DriverController, :location
   end
 end
