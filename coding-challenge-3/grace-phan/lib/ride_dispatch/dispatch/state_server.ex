@@ -7,6 +7,7 @@ defmodule RideDispatch.Dispatch.StateServer do
   alias RideDispatch.Location
   alias RideDispatch.Drivers.StateMachine
   alias RideDispatch.Dispatch.Matcher
+  alias RideDispatch.Dispatch.Offer
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
@@ -330,7 +331,8 @@ defmodule RideDispatch.Dispatch.StateServer do
   end
 
   defp accept_pending(ride, driver, offer, state) do
-    with {:ok, now} <- read_clock(state.clock),
+    with :ok <- offer_deadline(offer),
+         {:ok, now} <- acceptance_time(offer, state.clock),
          {:ok, accepted} <- RideStateMachine.transition(ride, :accept_offer),
          {:ok, busy} <- StateMachine.transition(driver, :accept_offer) do
       receipt =
@@ -346,6 +348,21 @@ defmodule RideDispatch.Dispatch.StateServer do
       {:reply, {:ok, accepted}, updated}
     else
       {:error, _reason} = error -> {:reply, error, state}
+    end
+  end
+
+  defp offer_deadline(%{created_at_ms: created, expires_at_ms: expires})
+       when is_integer(created) and is_integer(expires) and created < expires, do: :ok
+
+  defp offer_deadline(_offer), do: {:error, :inconsistent_ownership}
+
+  defp acceptance_time(offer, clock) do
+    with {:ok, now} <- read_clock(clock) do
+      cond do
+        now < offer.created_at_ms -> {:error, :invalid_clock}
+        Offer.expired?(offer, now) -> {:error, :offer_expired}
+        true -> {:ok, now}
+      end
     end
   end
 
