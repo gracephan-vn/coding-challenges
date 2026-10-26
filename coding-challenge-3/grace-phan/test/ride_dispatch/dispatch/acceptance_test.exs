@@ -134,6 +134,63 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
     )
   end
 
+  test "immediate replay and a discarded-result retry preserve the original acceptance evidence" do
+    {server, ride, offer, clock} = reserved()
+    :atomics.put(clock, 1, 123)
+    # The caller discards the result as if its response were lost.
+    task =
+      Task.async(fn ->
+        Store.accept_offer(server, ride.id, "D001")
+        :response_lost
+      end)
+
+    assert Task.await(task) == :response_lost
+    before = :sys.get_state(server)
+    accepted = before.offers[offer.id].acceptance_result
+    assert before.offers[offer.id].accepted_at_ms == 123
+    assert Store.accept_offer(server, ride.id, "D001") == {:ok, accepted}
+    :atomics.put(clock, 1, offer.expires_at_ms + 10_000)
+    assert Store.accept_offer(server, ride.id, "D001") == {:ok, accepted}
+    assert :sys.get_state(server) == before
+    # Proven replay does not read a new-attempt clock at all.
+    fixture = %{before | clock: fn -> raise "must not read on replay" end}
+
+    assert {:reply, {:ok, ^accepted}, ^fixture} =
+             StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, fixture)
+  end
+
+  test "synthetic accepted statuses without valid receipt identity are not replay evidence" do
+    {server, ride, offer, _} = reserved()
+    assert {:ok, accepted} = Store.accept_offer(server, ride.id, "D001")
+    state = :sys.get_state(server)
+    receipt = state.offers[offer.id]
+
+    variants = [
+      Map.delete(receipt, :acceptance_result),
+      Map.delete(receipt, :accepted_at_ms),
+      %{receipt | accepted_at_ms: -1},
+      %{receipt | accepted_at_ms: offer.expires_at_ms},
+      %{receipt | acceptance_result: %{accepted | id: "other"}},
+      %{receipt | acceptance_result: %{accepted | currentOfferId: "other"}},
+      %{receipt | acceptance_result: %{accepted | assignedDriverId: "D002"}},
+      %{receipt | acceptance_result: %{accepted | status: :driver_assigned}},
+      %{receipt | acceptance_result: Map.delete(accepted, :pickup)},
+      %{receipt | acceptance_result: %{accepted | passengerId: "other"}}
+    ]
+
+    for broken <- variants do
+      input = put_in(state.offers[offer.id], broken)
+
+      assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+               StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+    end
+
+    input = put_in(state.drivers["D001"].status, :available)
+
+    assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+             StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+  end
+
   defp matching(server, key) do
     {:ok, ride} = Store.create_ride(server, key, body())
 
