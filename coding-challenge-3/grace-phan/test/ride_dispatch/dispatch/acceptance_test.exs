@@ -76,6 +76,49 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
     }
   end
 
+  test "first acceptance before the deadline succeeds and equality/later keeps reservation held" do
+    {server, ride, offer, clock} = reserved()
+    :atomics.put(clock, 1, offer.expires_at_ms - 1)
+    assert {:ok, _} = Store.accept_offer(server, ride.id, "D001")
+    assert {:ok, %{accepted_at_ms: accepted_at}} = Store.get_offer(server, offer.id)
+    assert accepted_at == offer.expires_at_ms - 1
+
+    for offset <- [0, 1] do
+      {server, ride, offer, clock} = reserved()
+      :atomics.put(clock, 1, offer.expires_at_ms + offset)
+      before = :sys.get_state(server)
+      assert Store.accept_offer(server, ride.id, "D001") == {:error, :offer_expired}
+      assert :sys.get_state(server) == before
+      assert {:ok, %{status: :offered}} = Store.get_driver(server, "D001")
+      assert Store.get_offer(server, offer.id) == {:ok, offer}
+    end
+  end
+
+  test "synthetic malformed deadlines and invalid processing clocks cannot partially accept" do
+    {server, ride, offer, _} = reserved()
+    state = :sys.get_state(server)
+
+    for broken <- [
+          Map.delete(offer, :expires_at_ms),
+          %{offer | expires_at_ms: nil},
+          %{offer | expires_at_ms: "30000"},
+          %{offer | created_at_ms: 1.5},
+          %{offer | created_at_ms: offer.expires_at_ms}
+        ] do
+      input = put_in(state.offers[offer.id], broken)
+
+      assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+               StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+    end
+
+    for clock <- [fn -> nil end, fn -> 1.0 end, fn -> raise "clock" end, fn -> -1 end] do
+      input = %{state | clock: clock}
+
+      assert {:reply, {:error, :invalid_clock}, ^input} =
+               StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+    end
+  end
+
   defp owner(clock) do
     start_supervised!(
       Supervisor.child_spec(
