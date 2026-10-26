@@ -51,6 +51,7 @@ defmodule RideDispatch.Dispatch.StateServer do
          {:ok, offer} <- resolve_rejection_offer(ride, driver, state) do
       reject_pending(ride, driver, offer, state)
     else
+      {:replay, result} -> {:reply, {:ok, result}, state}
       :error -> {:reply, :not_found, state}
       :not_found -> {:reply, :not_found, state}
       {:error, _reason} = error -> {:reply, error, state}
@@ -369,6 +370,9 @@ defmodule RideDispatch.Dispatch.StateServer do
             [{key, offer}] ->
               with :ok <- record_identity(offer, key) do
                 cond do
+                  offer.status == :rejected or Map.has_key?(offer, :rejection_receipt) ->
+                    replay_rejection(ride, offer, state)
+
                   offer.id != Map.get(ride, :currentOfferId) ->
                     {:error, :invalid_transition}
 
@@ -397,6 +401,51 @@ defmodule RideDispatch.Dispatch.StateServer do
       if now >= offer.created_at_ms, do: {:ok, now}, else: {:error, :invalid_clock}
     end
   end
+
+  defp replay_rejection(ride, offer, state) do
+    valid_current? =
+      case ride.status do
+        status when status in [:driver_assigned, :driver_accepted] ->
+          consistent_assignment?(ride, state)
+
+        status when status in [:matching, :cancelled, :completed] ->
+          is_nil(Map.get(ride, :assignedDriverId)) and is_nil(Map.get(ride, :currentOfferId)) and
+            not Enum.any?(active_offers(state), &(&1.rideId == ride.id))
+
+        _ ->
+          false
+      end
+
+    if valid_current? and rejection_receipt?(offer, ride, state),
+      do: {:replay, offer.rejection_receipt.original_result},
+      else: {:error, :inconsistent_ownership}
+  end
+
+  defp rejection_receipt?(%{status: :rejected, rejection_receipt: receipt} = offer, ride, state)
+       when is_map(receipt) do
+    event_id = "redispatch-" <> offer.id
+    event = Map.get(state.pending_events, event_id)
+    result = Map.get(receipt, :original_result)
+    at = Map.get(receipt, :rejected_at_ms)
+
+    offer_deadline(offer) == :ok and is_integer(at) and at >= offer.created_at_ms and
+      not Map.has_key?(offer, :accepted_at_ms) and not Map.has_key?(offer, :acceptance_result) and
+      Map.get(receipt, :offerId) == offer.id and Map.get(receipt, :rideId) == offer.rideId and
+      Map.get(receipt, :driverId) == offer.driverId and
+      Map.get(receipt, :redispatch_event_id) == event_id and
+      is_map(event) and Map.get(event, :eventId) == event_id and
+      Map.get(event, :rideId) == ride.id and Map.get(event, :type) == :dispatch_requested and
+      Map.get(event, :status) in [:pending, :processed, :failed] and
+      is_map(result) and Map.get(result, :status) == :matching and
+      Map.fetch(result, :assignedDriverId) == {:ok, nil} and
+      Map.fetch(result, :currentOfferId) == {:ok, nil} and
+      Enum.all?(
+        [:id, :passengerId, :pickup, :destination],
+        &(Map.has_key?(result, &1) and Map.fetch(result, &1) == Map.fetch(ride, &1))
+      )
+  end
+
+  defp rejection_receipt?(_offer, _ride, _state), do: false
 
   defp record_identity(%{id: id, status: _status}, id), do: :ok
   defp record_identity(_record, _id), do: {:error, :inconsistent_ownership}
