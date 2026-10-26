@@ -75,7 +75,9 @@ retrying with the same key is safe while the owner survives. After owner crash o
 restart, keys, Rides and events are lost; a retry can create a new Ride. This is
 not crash-durable idempotency or a durable transactional outbox. One mailbox
 serializes reads/writes, records grow without eviction, and there are no external
-side-effect transactions or multi-node guarantees. Offer rejection, expiration, cancellation/completion, release and rematching remain future features; acceptance is implemented below. See [AC traceability](docs/ac-traceability.md) for evidence boundaries.
+side-effect transactions or multi-node guarantees. Acceptance, rejection, release
+and rejection-triggered rematching are implemented below; expiration and
+cancellation/completion remain future features. See [AC traceability](docs/ac-traceability.md) for evidence boundaries.
 
 
 ## Asynchronous event processing and reservation (Features #10A/#10B)
@@ -84,7 +86,7 @@ Asynchronous processing keeps matching outside the HTTP response lifecycle and
 lets pending work survive request completion or dispatcher restart while its owner
 remains alive. One supervised `Dispatch.EventDispatcher` starts after the named StateServer,
 independently of HTTP. Store operations accept an explicit PID/name for isolated
-tests. After a successful create call, the Store wrapper requests a wake-up hint;
+tests. After a successful create or reject call, the Store wrapper requests a wake-up hint;
 creation's atomic callback does not publish events or spawn tasks. Startup and
 one-second recovery scans cover missed notifications, including a lost creation
 reply. Hints coalesce; only due supported events are selected, one per dispatcher
@@ -131,7 +133,7 @@ Offers retain `id`, `rideId`, `driverId`, `status: :pending`, `created_at_ms` an
 `expires_at_ms`. IDs use an independent `offer-` prefix and VM-wide unique counter.
 `Store.get_offer/2` and `Store.list_offers/1` are read-only queries; the latter sorts
 by ID. Retained rejected/expired Offer history supplies permanent Ride-scoped
-exclusions; generating those outcomes belongs to future lifecycle commands.
+exclusions; rejection records these outcomes now, while expiration remains future work.
 
 Application configuration `:ride_dispatch, :matching_radius_km` defaults to 2.0
 (nonnegative number); `:offer_timeout_ms` defaults to 30_000 (positive integer).
@@ -144,9 +146,10 @@ not impose fixed-width overflow. Negative monotonic values are valid; timestamps
 are not meaningful across VM restarts. Invalid runtime clock readings leave
 business state unchanged; discovery returns no actionable work until a later scan.
 
-A deadline passing does not close a pending Offer or release its Driver. Only a
-future explicit lifecycle command may do so. There is no expiration scheduler,
-rejection, cancellation, completion or active rematching yet.
+A deadline passing does not close a pending Offer or release its Driver. Only an
+explicit rejection or future expiration command may release it. There is no
+expiration scheduler, cancellation or completion; rematching occurs after rejection,
+with no continuous search loop.
 
 There are no claims, leases, or separate acknowledgements. Event records remain
 in the authoritative `pending_events` map after processing/failure. Attempt count
@@ -244,7 +247,7 @@ Retries after uncertain/lost responses are safe while the owner survives; receip
 are lost with all other runtime state after owner crash. Tests discard completed
 responses to model loss; no real network-disconnection guarantee is claimed.
 
-Executed verification: 18 acceptance Store tests, 10 HTTP acceptance tests;
+Historical Feature #11 verification: 18 acceptance Store tests, 10 HTTP acceptance tests;
 156 focused regressions and **194 full-suite tests passed**. Compilation with
 warnings as errors, formatting and diff checks passed. Run:
 
@@ -257,10 +260,86 @@ two-Ride reservation races continue through acceptance; another Ride cannot take
 the BUSY Driver. Acceptance also competes directly with another Ride's dispatch,
 and real asynchronous dispatcher tests preserve accepted ownership. Final Ride,
 Driver, Offer and Event records are asserted. Redispatch of the original losing
-Ride uses a synthetic new-event fixture: no public redispatch trigger exists.
+Ride uses a synthetic new-event fixture: no generic manual redispatch command exists.
 
 AC-08's specified creation/acceptance/transition idempotency and AC-09's concurrent
 assignment requirements are VERIFIED with these tests and documented strategies.
-This does not complete AC-02/05/06/07 or prove future reject/expire/cancel/complete
-races; those workflows and their live integration tests remain absent. See
+Feature #12 extends this evidence to rejection/rematching below. Expiration,
+cancellation and completion remain absent; AC-02/05/06 remain PARTIAL. See
 [AC traceability](docs/ac-traceability.md) for the evidence boundaries.
+
+## Offer rejection and automatic rematching (Feature #12)
+
+`POST /rides/{rideId}/offers/{driverId}/reject` accepts no body or `{}`, with no
+Offer ID or Idempotency-Key. `Rides.reject_offer/3` delegates to
+`Store.reject_offer(server, ride_id, driver_id)`, returning
+`{:ok, original_matching_ride}`, `:not_found`, or `{:error, reason}`. HTTP success
+and verified replay both return **200** with the existing Ride `data` envelope,
+`status: "MATCHING"` and `assignedDriverId: null`. GET always returns current state.
+Malformed/unsupported fields, non-object JSON and unparsed nonempty bodies return
+**400**; unknown resources/absent relationship **404**; wrong holder, accepted,
+stale or ambiguous operations **409**; corrupt invariants/trusted time **500**.
+Errors retain sanitized `errors.detail`; URL Driver identity is not authentication.
+
+The single callback validates exact current Offer/storage identity, linked
+Ride/Driver ownership, active uniqueness, absence of contradictory acceptance
+evidence and timestamps, then applies both `:reject_offer` State Machine actions:
+
+```text
+Ride MATCHING + assignedDriverId/currentOfferId nil
+Driver AVAILABLE + original Offer REJECTED
+one DispatchRequested PENDING, eventId = "redispatch-" <> offer.id
+```
+
+The Offer retains immutable `rejection_receipt` fields `offerId`, `rideId`,
+`driverId`, `rejected_at_ms`, `redispatch_event_id` and `original_result` (the
+matching Ride snapshot). Event-ID collision rejects the entire command. Replay
+requires matching receipt/storage identities, valid original result and the linked
+DispatchRequested record; its status may be PENDING, PROCESSED or FAILED. It never
+releases a Driver again, alters replacement ownership, rewrites receipts or creates
+another event, including after replacement acceptance or Driver reuse elsewhere.
+Failed rematching does not undo rejection. Multiple Offers for the same Ride/Driver
+pair are conservatively ambiguous because the route has no Offer ID.
+
+Late rejection at/after the deadline is an approved policy while the Offer remains
+current PENDING with valid reservation ownership. Trusted processing time must be
+an integer no earlier than Offer creation; no automatic expiration or implicit
+release occurs from a passed deadline alone. Previously accepted Offers cannot be
+rejected. A closed unaccepted historical Offer is classified before new-acceptance
+exclusivity checks: stale A acceptance after B accepts returns **409**, while
+malformed acceptance evidence still returns a controlled invariant failure.
+
+After commit, Store sends only a wake-up hint. The existing dispatcher consumes
+the replacement event using latest authoritative locations/availability, configured
+radius and deterministic ties. Rejected Drivers remain excluded for that Ride
+forever, but may serve unrelated Rides. A successful no-candidate attempt is
+PROCESSED with `:no_candidate` and increments attempts for that processing call,
+without charging an infrastructure failure or creating a new event. Technical
+failures retain bounded retry/backoff/FAILED behavior;
+timeouts remain uncertain and require authoritative rechecks. Missed hints and
+worker restart are recovered by scanning while the owner survives.
+
+Atomic Store tests run without a dispatcher and observe the new event PENDING.
+Live HTTP/dispatcher observations can already see it PROCESSED; exact identity,
+history and business effects remain required. Original creation and rejection
+responses remain unchanged even when current Ride state progresses.
+
+Executed: **16 rejection Store**, **10 rematching/recovery**, **10 rejection HTTP**
+tests; **64** focused acceptance/rejection/rematching/HTTP tests and **230** full
+suite tests passed. Compile warnings-as-errors, format and diff checks passed.
+Tests prove A → B, latest candidate changes, exhaustion and other-Ride eligibility,
+competing duplicate Rejects, ordered and competing Accept/Reject, two unrelated
+Rides competing for released A, exactly-one events, restart before/after commit,
+technical failure versus no candidate, and replay after an actual queued Store
+call timeout. Dispatcher timeout signals remain controlled simulations; discarded
+HTTP responses do not simulate a real TCP disconnect. Terminal replay is tested
+only with labeled callback fixtures, not live lifecycle commands.
+
+```sh
+mix test test/ride_dispatch/dispatch/rejection_test.exs test/ride_dispatch/dispatch/rematching_test.exs test/ride_dispatch_web/controllers/offer_rejection_test.exs
+```
+
+AC-07 is VERIFIED for its rejection/rematching clauses; AC-08/09/10 regressions
+remain green. One mailbox, history scans/retention, volatile owner loss and
+single-node limits remain. Expiration, cancellation and completion are future
+work; their races and live terminal replay must be tested when implemented.
