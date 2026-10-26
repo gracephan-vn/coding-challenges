@@ -291,11 +291,18 @@ defmodule RideDispatch.Dispatch.StateServer do
   defp process_dispatch_requested(event, state) do
     ride = state.rides[event.rideId]
 
+    exclusions =
+      state.offers
+      |> Map.values()
+      |> Enum.filter(&(&1.rideId == ride.id and &1.status in [:rejected, :expired]))
+      |> Enum.map(& &1.driverId)
+
     case Matcher.nearest(ride.pickup, Map.values(state.drivers),
-           radius_km: state.matching_radius_km
+           radius_km: state.matching_radius_km,
+           excluded_driver_ids: exclusions
          ) do
       {:ok, driver} -> reserve(event, ride, driver, state)
-      :none -> {:reply, {:error, :no_candidate}, state}
+      :none -> {:reply, {:ok, :processed}, put_event(state, processed(event, :no_candidate))}
       {:error, reason} -> permanent_failure(state, event, reason)
     end
   end
