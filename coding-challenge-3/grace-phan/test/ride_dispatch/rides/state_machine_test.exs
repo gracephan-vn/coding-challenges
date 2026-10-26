@@ -74,6 +74,40 @@ defmodule RideDispatch.Rides.StateMachineTest do
     end
   end
 
+  test "missing or unknown current states return invalid_state" do
+    for invalid <- [
+          nil,
+          [],
+          :requested,
+          %{},
+          %{status: nil},
+          %{status: :unknown},
+          %{status: "REQUESTED"},
+          %{status: 1}
+        ],
+        action <- [:start_matching, :cancel_ride, :unknown] do
+      assert StateMachine.transition(invalid, action) == {:error, :invalid_state}
+    end
+  end
+
+  test "unsupported actions are rejected in every known state" do
+    for status <- @states,
+        action <- [:unknown, nil, :driver_assigned, "cancel_ride", {:set_status, :completed}] do
+      assert StateMachine.transition(ride(status), action) == {:error, :invalid_transition}
+    end
+  end
+
+  test "state-only transitions need no offer details and are deterministic" do
+    assert StateMachine.transition(%{status: :driver_assigned}, :accept_offer) ==
+             {:ok, %{status: :driver_accepted}}
+
+    original = %{status: :driver_assigned, assignedDriverId: "D001", expiresAt: :not_checked}
+    expected = %{original | status: :matching}
+    assert StateMachine.transition(original, :expire_offer) == {:ok, expected}
+    assert StateMachine.transition(original, :expire_offer) == {:ok, expected}
+    assert expected.assignedDriverId == "D001"
+  end
+
   defp ride(status) do
     %{
       id: "R001",
