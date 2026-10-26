@@ -11,7 +11,8 @@ defmodule RideDispatch.Application do
       RideDispatchWeb.Telemetry,
       {DNSCluster, query: Application.get_env(:ride_dispatch, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: RideDispatch.PubSub},
-      {RideDispatch.Dispatch.StateServer, name: RideDispatch.Dispatch.StateServer},
+      {RideDispatch.Dispatch.StateServer,
+       name: RideDispatch.Dispatch.StateServer, passengers: [%{id: "P001"}]},
       # Start to serve requests, typically the last entry
       RideDispatchWeb.Endpoint
     ]

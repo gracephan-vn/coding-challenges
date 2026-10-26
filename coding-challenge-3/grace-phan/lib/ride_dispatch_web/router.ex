@@ -8,6 +8,9 @@ defmodule RideDispatchWeb.Router do
   scope "/", RideDispatchWeb do
     pipe_through :api
 
+    post "/rides", RideController, :create
+    get "/rides/:rideId", RideController, :show
+
     put "/drivers/:id/availability", DriverController, :availability
     put "/drivers/:id/location", DriverController, :location
   end
