@@ -8,7 +8,7 @@
 
 **Trạng thái tài liệu:** Đây là kế hoạch triển khai đang phát triển, không phải bằng chứng hoàn thành AC. **IMPLEMENTED** = có code; **PLANNED** = chưa triển khai; **VERIFIED** chỉ áp dụng cho hành vi có tests đã chạy, không tự động cho toàn bộ AC. Đối chiếu tiến độ và các khoảng trống tại [AC traceability](ac-traceability.md).
 
-**IMPLEMENTED hiện tại:** `Location.valid?/1`, `Location.distance_km/2`, `Dispatch.Matcher.nearest/3`, `Drivers.StateMachine.transition/2`, `Rides.StateMachine.transition/2`, Driver HTTP và Ride POST/GET. Store/StateServer giữ Driver, seeded Passenger, Ride, creation idempotency và pending RideCreated records. **IMPLEMENTED 10A:** supervised EventDispatcher xử lý RideCreated thành MATCHING và một pending DispatchRequested, với atomic acknowledgement và bounded retries. **PLANNED:** DispatchRequested handler, RideOffer, các lifecycle transitions khác, reservation và rematching. Phoenix.PubSub không phải transport của consumer này.
+**IMPLEMENTED hiện tại:** `Location.valid?/1`, `Location.distance_km/2`, `Dispatch.Matcher.nearest/3`, `Drivers.StateMachine.transition/2`, `Rides.StateMachine.transition/2`, Driver HTTP và Ride POST/GET. Store/StateServer giữ Driver, seeded Passenger, Ride, Offer, creation idempotency và retained events. **IMPLEMENTED 10A/10B:** supervised EventDispatcher xử lý RideCreated rồi DispatchRequested; matching/reservation/acknowledgement nguyên tử, với bounded retries. **PLANNED:** accept/reject/expire/cancel/complete và rematching. Phoenix.PubSub không phải transport của consumer này.
 
 **Đề bắt buộc:** API Ride và Driver; trạng thái Driver (`OFFLINE`, `AVAILABLE`, `OFFERED`, `BUSY`), trạng thái Ride (`REQUESTED`, `MATCHING`, `DRIVER_ASSIGNED`, `DRIVER_ACCEPTED`, `CANCELLED`, `COMPLETED`); tọa độ hợp lệ; nearest available trong bán kính 2 km, tie-break theo `driverId`; pending offer và timeout mặc định 30 giây; accept/reject/cancel/complete; loại tài xế đã từ chối/hết hạn khỏi các lần matching sau của cùng Ride; `Idempotency-Key` và duplicate-safe transitions; concurrency test với **hai rides khác nhau** tranh một driver; event-driven dispatch; automated tests; logs với `rideId`, `driverId`, `eventId`; README, architecture diagram, sequence diagram, hai ADR; scaling 1k/100k/1m drivers, tối thiểu 3 bottlenecks/3 strategies/2 trade-offs.
 
@@ -29,9 +29,9 @@
 
 **Nguyên tắc kiến trúc:** application/controllers/workers gọi `Dispatch.Store`, không gọi trực tiếp `GenServer.call` hoặc truy cập Maps nội bộ. Chỉ state owner được cập nhật các Maps/Offer; về sau nếu thêm ETS read projection thì chỉ owner được ghi vào projection. Chức năng thuần (`Matcher`, `StateMachine`, `Domain`) kiểm tra và tính trạng thái mới; `StateServer` là nơi chấp nhận lệnh và áp dụng một snapshot mới nguyên tử. Không gọi external HTTP hay chạy công việc chờ lâu trong callback của GenServer. Việc xử lý message của một server tuần tự không biến **toàn bộ cluster** thành một transaction.
 
-### Sơ đồ logic mục tiêu — PLANNED cho Ride/Offer/Event
+### Sơ đồ logic — reservation IMPLEMENTED; timeout/lifecycle PLANNED
 
-Hiện tại: `DriverController → Dispatch.Store → Dispatch.StateServer`; Ride HTTP dùng `RideController → Rides → Dispatch.Store → Dispatch.StateServer`; `Location`, `Drivers.StateMachine` và `Dispatch.Matcher` là functional core. Matcher chưa được nối vào Store/ride dispatch. Sơ đồ dưới đây mô tả kiến trúc mục tiêu, không phải toàn bộ code hiện có.
+Hiện tại: `DriverController → Dispatch.Store → Dispatch.StateServer`; Ride HTTP dùng `RideController → Rides → Dispatch.Store → Dispatch.StateServer`; `Location`, `Drivers.StateMachine` và `Dispatch.Matcher` là functional core. StateServer gọi Matcher và hai State Machines trong atomic event callback. Timeout scheduler trong sơ đồ vẫn PLANNED.
 
 ```mermaid
 flowchart TD
@@ -40,12 +40,11 @@ flowchart TD
   PORT --> STORE[StateServer - GenServer]
   STORE --> CORE[Pure domain core: matching / transitions / validation]
   STORE --> STATE[Maps: rides / drivers / offers / idempotency / events]
-  PUMP[Supervised EventDispatcher] -->|poll / claim / ack| PORT
-  PUMP -->|DispatchRide command| APP
+  PUMP[Supervised EventDispatcher] -->|discovery / atomic process_event| PORT
   TIMER[Supervised timeout scheduler] -->|ExpireOffer command| APP
 ```
 
-**IMPLEMENTED:** `CreateRide` tạo Ride, idempotency record và pending `RideCreated` trong cùng một lần đổi state. **IMPLEMENTED 10A:** EventDispatcher tiêu thụ RideCreated bất đồng bộ qua Store. **PLANNED:** DispatchRequested consumption và Driver matching; POST không gọi matching.
+**IMPLEMENTED:** `CreateRide` tạo Ride, idempotency record và pending `RideCreated` trong cùng một lần đổi state. **IMPLEMENTED 10A:** EventDispatcher tiêu thụ RideCreated bất đồng bộ qua Store. **IMPLEMENTED 10B:** DispatchRequested consumption, nearest matching và pending Offer reservation; POST chỉ tạo pending work.
 
 ## C. Git và cài môi trường — từng lệnh
 
@@ -155,12 +154,12 @@ Một số vòng không cần refactor commit nếu không có thay đổi. Gi�
 
 ### D1. Model
 
-**IMPLEMENTED:** Driver dùng string `:id`, atom `:status` (`:offline`, `:available`, `:offered`, `:busy`) và atom keys `:latitude`/`:longitude`; Location nhận coordinate maps. StateServer giữ maps `drivers`, `passengers`, `rides`, `idempotency`, `pending_events`. Passenger và Ride đã IMPLEMENTED; RideOffer vẫn **PLANNED**.
+**IMPLEMENTED:** Driver dùng string `:id`, atom `:status` (`:offline`, `:available`, `:offered`, `:busy`) và atom keys `:latitude`/`:longitude`; Location nhận coordinate maps. StateServer giữ maps `drivers`, `passengers`, `rides`, `offers`, `idempotency`, `pending_events`. Pending RideOffer reservation đã IMPLEMENTED; lifecycle còn PLANNED.
 
 - `Passenger`: `id` (seeded; registration out of scope).
 - `Driver`: `id`, `status`, `latitude`, `longitude`.
-- `Ride`: `id`, `passengerId`, `pickup`, `destination`, `status`, `assignedDriverId`.
-- `RideOffer`: `id`, `rideId`, `driverId`, `status` (`PENDING`, `ACCEPTED`, `REJECTED`, `EXPIRED`, `CANCELLED`, `COMPLETED`), `expiresAt`, timestamps.
+- `Ride`: `id`, `passengerId`, `pickup`, `destination`, `status`, `assignedDriverId`; reservation thêm `currentOfferId` (missing được hiểu là nil trước assignment). Original creation result và HTTP schema không đổi.
+- `RideOffer` IMPLEMENTED: `id`, `rideId`, `driverId`, `status: :pending`, `created_at_ms`, `expires_at_ms`. Các status lịch sử `:accepted`, `:rejected`, `:expired`, `:cancelled`, `:completed` thuộc lifecycle PLANNED.
 - `Location`: value object, validate latitude [-90,90], longitude [-180,180].
 
 `RideOffer` fields/statuses là **lựa chọn implementation**, không phải status list được đề áp đặt. Một Ride có thể có nhiều offers lịch sử, nhưng chỉ một current offer. `assignedDriverId` của Ride phản ánh current offer/accepted ride; xóa khi rejection và timeout.
@@ -173,7 +172,7 @@ Một số vòng không cần refactor commit nếu không có thay đổi. Gi�
 
 ### D2. Quy tắc state
 
-**IMPLEMENTED:** `Drivers.StateMachine.transition(driver_map, action)` trả `{:ok, updated_driver}`, `{:error, :invalid_transition}` hoặc `{:error, :invalid_state}`; giữ nguyên các field khác. Public availability actions là `:enable_availability`/`:disable_availability`. Lặp lại availability đã thỏa mãn thành successful no-op là quyết định thiết kế, không phải response contract do đề bắt buộc. Internal actions (`:reserve_for_offer`, `:accept_offer`, `:reject_offer`, `:expire_offer`, `:cancel_offer`, `:complete_ride`, `:cancel_accepted_ride`) chỉ kiểm tra source state; không xác thực offer/deadline/ownership/idempotency hoặc tạo reservation. **IMPLEMENTED:** `Rides.StateMachine.transition(ride_map, action)` trả `{:ok, updated_ride}` hoặc `{:error, :invalid_state | :invalid_transition}`. Chỉ đổi status; các action là `:start_matching`, `:create_offer`, `:accept_offer`, `:reject_offer`, `:expire_offer`, `:complete_ride`, `:cancel_ride`. Terminal states không có outgoing transitions; repeated action bị từ chối nếu source state không còn phù hợp. Field khác được giữ nguyên, kể cả assignment. **IMPLEMENTED 10A:** REQUESTED → MATCHING được persist nguyên tử với event acknowledgement và successor. **PLANNED:** các persisted lifecycle commands khác, assignment cleanup, offer identity/deadline checks và duplicate history.
+**IMPLEMENTED:** `Drivers.StateMachine.transition(driver_map, action)` trả `{:ok, updated_driver}`, `{:error, :invalid_transition}` hoặc `{:error, :invalid_state}`; giữ nguyên các field khác. Public availability actions là `:enable_availability`/`:disable_availability`. Lặp lại availability đã thỏa mãn thành successful no-op là quyết định thiết kế, không phải response contract do đề bắt buộc. Internal actions (`:reserve_for_offer`, `:accept_offer`, `:reject_offer`, `:expire_offer`, `:cancel_offer`, `:complete_ride`, `:cancel_accepted_ride`) chỉ kiểm tra source state; không xác thực offer/deadline/ownership/idempotency hoặc tạo reservation. **IMPLEMENTED:** `Rides.StateMachine.transition(ride_map, action)` trả `{:ok, updated_ride}` hoặc `{:error, :invalid_state | :invalid_transition}`. Chỉ đổi status; các action là `:start_matching`, `:create_offer`, `:accept_offer`, `:reject_offer`, `:expire_offer`, `:complete_ride`, `:cancel_ride`. Terminal states không có outgoing transitions; repeated action bị từ chối nếu source state không còn phù hợp. Field khác được giữ nguyên, kể cả assignment. **IMPLEMENTED 10A/10B:** REQUESTED → MATCHING, rồi MATCHING → DRIVER_ASSIGNED và AVAILABLE → OFFERED được persist cùng event acknowledgement và Offer. **PLANNED:** các persisted lifecycle commands khác, assignment cleanup, accept/reject ownership/deadline checks.
 
 ```text
 Ride: REQUESTED -> MATCHING -> DRIVER_ASSIGNED -> DRIVER_ACCEPTED -> COMPLETED
@@ -192,7 +191,7 @@ Driver: OFFLINE <-> AVAILABLE -> OFFERED -> BUSY
 
 ### D3. Invariants
 
-Các multi-entity invariants dưới đây là **PLANNED**, chưa được chứng minh bằng pure State Machine/Matcher hoặc concurrency tests cho Driver updates. AC-09 cần hai Ride thật cạnh tranh cùng Driver sau khi reservation được triển khai.
+Reservation invariants đã IMPLEMENTED và kiểm tra bằng hai Ride thật cạnh tranh một Driver. Accept/reject/timeout/cancel/complete invariants bên dưới vẫn PLANNED. Không suy ra accepted-Ride concurrency safety từ pending-offer tests.
 
 - Mỗi Driver chiếm tối đa một Ride đang `DRIVER_ASSIGNED` hoặc `DRIVER_ACCEPTED`.
 - Mỗi Ride có tối đa một active `RideOffer`.
@@ -211,21 +210,23 @@ IMPLEMENTED — queries
 Dispatch.Store.get_driver(server, driver_id)              # {:ok, driver} | :not_found
 Dispatch.Store.list_available_drivers(server)             # list, lexicographic ID order
 Dispatch.Store.get_ride(server, ride_id)                  # {:ok, current_ride} | :not_found
+Dispatch.Store.get_offer(server, offer_id)                # {:ok, offer} | :not_found
+Dispatch.Store.list_offers(server)                        # retained Offers, sorted by ID
 Dispatch.Store.list_events(server)                       # all retained records, sorted by eventId
 Dispatch.Store.get_event(server, event_id)               # {:ok, event} | :not_found
-Dispatch.Store.list_actionable_events(server)            # due RideCreated records only
+Dispatch.Store.list_actionable_events(server)            # due RideCreated / DispatchRequested
 Dispatch.Store.next_event_delay(server)                  # milliseconds until due, or nil
 
 IMPLEMENTED — atomic commands
 Dispatch.Store.set_driver_availability(server, driver_id, available?)
 Dispatch.Store.update_driver_location(server, driver_id, location)
 Dispatch.Store.create_ride(server, key, request)           # strict string-keyed request
-Dispatch.Store.process_event(server, event_id)            # transition + ack + successor
+Dispatch.Store.process_event(server, event_id)            # RideCreated or atomic matching/reservation + ack
 Dispatch.Store.fail_event(server, event_id, attempts, :processing_failed)
 Dispatch.Store.subscribe_events(server)                  # calling dispatcher receives wake hints
 
 PLANNED — signatures remain provisional
-Dispatch.Store.dispatch_ride(server, ride_id, now)
+# Reservation uses process_event/2; no separate dispatch_ride command.
 Dispatch.Store.accept_offer(server, ride_id, driver_id, now)
 Dispatch.Store.reject_offer(server, ride_id, driver_id, now)
 Dispatch.Store.expire_offer(server, offer_id, now)
@@ -258,11 +259,11 @@ Sau này:   Phoenix → Application → Dispatch.Store ─┬→ GenServer: writ
 
 ### D5. ID và dữ liệu khởi tạo
 
-**IMPLEMENTED:** Production seed Passenger `P001`; Drivers rỗng. Ride IDs `ride-N` và Event IDs `event-N` dùng `System.unique_integer([:positive, :monotonic])` trong callback: unique toàn VM, distinct prefixes, không bảo đảm uniqueness qua VM restart. Không có restored state hoặc distributed identity. **PLANNED demo:** Drivers `D001`/`D002`/`D003`.
+**IMPLEMENTED:** Production seed Passenger `P001`; Drivers rỗng. Ride IDs `ride-N` và Event IDs `event-N` dùng `System.unique_integer([:positive, :monotonic])` trong callback: unique toàn VM, distinct prefixes, không bảo đảm uniqueness qua VM restart. Không có restored state hoặc distributed identity. Offer IDs dùng independent prefix `offer-` và cùng VM-wide counter; không phục hồi state qua VM restart. **PLANNED demo:** Drivers `D001`/`D002`/`D003`.
 
 ## E. Lộ trình triển khai **TDD-first** (kế hoạch ban đầu, không phải tiến độ)
 
-Thứ tự bảng này là kế hoạch ban đầu. Thực tế đã làm Location validation, Haversine, Matcher, Store foundation, Driver State Machine, availability Store integration và Driver HTTP. Pure Ride State Machine và Ride creation/retrieval/idempotency đã triển khai; RideCreated consumption đã IMPLEMENTED; DispatchRequested consumption vẫn PLANNED. Xem `ac-traceability.md` để đánh giá AC thay vì suy ra từ thứ tự slice.
+Thứ tự bảng này là kế hoạch ban đầu. Thực tế đã làm Location validation, Haversine, Matcher, Store foundation, Driver State Machine, availability Store integration và Driver HTTP. Pure Ride State Machine và Ride creation/retrieval/idempotency đã triển khai; RideCreated/DispatchRequested consumption và atomic reservation đã IMPLEMENTED. Xem `ac-traceability.md` để đánh giá AC thay vì suy ra từ thứ tự slice.
 
 Mỗi mục bắt buộc đi theo: **RED test → GREEN implementation → REFACTOR → commit evidence → chạy full suite**.
 
@@ -285,7 +286,7 @@ Mỗi mục bắt buộc đi theo: **RED test → GREEN implementation → REFAC
 | 15. Observability | operation emits correlated event log | structured Logger metadata | trace R001 by `rideId`, `driverId`, `eventId` | extra |
 | 16. E2E + docs | Phoenix API scenario exercises A reject → B accept → complete | automated end-to-end test + README/ADRs | all required tests & diagrams | all |
 
-**Đặc biệt khi code matching:** Hàm pure trả về *candidate*, không phải driver đã reserve. Matcher hiện dùng Haversine và `Enum.min_by` theo `{distance, driver.id}`, không sort toàn bộ candidates. **PLANNED reservation:** Việc chọn và reserve phải nằm trong cùng **một StateServer command** hoặc phải kiểm tra lại tại state owner trước khi commit. Tính từ current state **ngay trong callback**, rồi cập nhật Ride, Driver, Offer trong một return mới. O(n) matching có thể giữ mailbox lâu khi tập driver lớn — cần đo trước khi tối ưu.
+**Đặc biệt khi code matching:** Hàm pure trả về *candidate*, không phải driver đã reserve. Matcher hiện dùng Haversine và `Enum.min_by` theo `{distance, driver.id}`, không sort toàn bộ candidates. **IMPLEMENTED reservation:** Việc chọn và reserve nằm trong cùng **một StateServer event command**. Tính từ current state **ngay trong callback**, rồi cập nhật Ride, Driver, Offer trong một return mới. O(n) matching có thể giữ mailbox lâu khi tập driver lớn — cần đo trước khi tối ưu.
 
 ### E1. Ví dụ TDD lịch sử — không phải API hiện tại
 
@@ -325,11 +326,11 @@ Chạy lại `mix test test/ride_dispatch/rides/state_machine_test.exs`; khi pas
 
 ### F1. Test bắt buộc: hai rides cạnh tranh cùng driver
 
-**PLANNED AC-09 test:** chưa có reservation hoặc test hai Ride cạnh tranh driver trong code hiện tại.
+**VERIFIED pending reservation:** `reservation_test.exs` dùng hai barrier-released Store callers, chạy 20 lần; `reservation_dispatcher_test.exs` cho real dispatcher cạnh tranh Store caller. Assert final state của cả Rides, Driver, Offers và Events. AC-09 còn PARTIAL vì accepted lifecycle chưa có integration evidence.
 
 ```text
 Given: D001 AVAILABLE; R001 MATCHING; R002 MATCHING
-When: hai Task khác nhau đồng thời gọi dispatch_ride(server, R001/R002)
+When: hai Task khác nhau đồng thời gọi process_event(server, event_id của R001/R002)
 Then: không quá một offer ACTIVE cho D001;
       không quá một Ride có assignedDriverId = D001;
       Ride còn lại MATCHING/nil hoặc chọn driver khác.
@@ -348,33 +349,37 @@ Khi hai event cùng `rideId`, tối đa một current offer. Event đã xử lý
 - **ETS read projection**: có thể chuyển nhiều reads khỏi mailbox; GenServer vẫn sở hữu mutations và phải revalidate trước reserve. Cache stale, O(n) scan và vòng đời ETS là những trade-offs cần test/đo.
 - **PostgreSQL**: cung cấp row locking/transaction/durability nhưng thêm infrastructure và test setup.
 
-## G. Asynchronous RideCreated IMPLEMENTED; Driver matching và timeout PLANNED
+## G. Asynchronous matching/reservation IMPLEMENTED; timeout processing PLANNED
 
-### G1. Event contract và processing — IMPLEMENTED 10A
+### G1. Event contract và processing — IMPLEMENTED 10A/10B
 
 CreateRide vẫn atomically tạo Ride REQUESTED, original idempotency result và pending RideCreated. Sau reply thành công, Store wrapper gửi notification request; owner chuyển wake hint cho subscribed dispatcher ngoài business callback. Hint không phải nguồn chân lý. Một supervised EventDispatcher khởi động độc lập HTTP, scan lúc startup, nhận hints và recovery scan tối đa mỗi 1000ms. Mỗi lượt xử lý một supported due event; một timer được thay thế khi cần, obsolete timer messages bị bỏ qua.
 
 `Store.process_event(server, event_id)` atomically dùng `Rides.StateMachine.transition/2` cho REQUESTED → MATCHING, đánh dấu RideCreated PROCESSED và tạo đúng một `%{eventId: "dispatch-" <> ride.id, rideId: ride.id, type: :dispatch_requested, status: :pending}`. Không publish, spawn task hoặc external I/O trong callback. Không claim/lease hoặc separate acknowledgement. `pending_events` giữ cả pending, processed và failed history.
 
-Kết quả: `{:ok, :processed}`, `{:ok, :already_processed}`, `{:ok, :ignored}`, `:not_found`, hoặc `{:error, reason}`. Reason là `:unsupported_event`, `:failed`, `{:retry_at, deadline}`, `{:permanent, :ride_not_found}` hoặc `{:permanent, :invalid_state}`. Repeated processed event không đổi state. Distinct duplicate gặp MATCHING hoặc trạng thái known later/terminal được ack ignored, không đổi Ride hoặc tạo successor khác. Missing/invalid Ride bị failed permanently, không retry.
+Kết quả: `{:ok, :processed}`, `{:ok, :already_processed}`, `{:ok, :ignored}`, `:not_found`, hoặc `{:error, reason}`. Reason gồm `:unsupported_event`, `:failed`, `:invalid_clock`, `{:retry_at, deadline}` hoặc `{:permanent, reason}` (`:ride_not_found`, `:invalid_state`, `:invalid_pickup`, `:invalid_event`, `:inconsistent_ownership`). Repeated processed event không đổi state. Distinct duplicate RideCreated gặp MATCHING hoặc trạng thái known later/terminal được ack ignored, không đổi Ride hoặc tạo successor khác. Missing/invalid Ride bị failed permanently, không retry.
 
-DispatchRequested chưa có handler: giữ nguyên PENDING, không tăng attempts hoặc mark failed, không nằm trong actionable discovery/timers. `list_events/1` và `get_event/2` vẫn trả các records này cho 10B. 10B mở rộng cùng processing command để matching/reservation và acknowledgement cùng callback; không reopen RideCreated đã processed.
+DispatchRequested đã actionable, kể cả pending records tạo từ 10A. Callback đọc Ride MATCHING và latest Drivers, lấy Ride-scoped exclusions từ retained rejected/expired Offers, gọi Matcher với owner radius, kiểm tra conflicting active Ride/Offer ownership rồi dùng hai State Machines. Một snapshot mới ghi Ride DRIVER_ASSIGNED (`assignedDriverId`/`currentOfferId`), Driver OFFERED, Offer PENDING và processed Event (`outcome: :offer_created`). Không dùng public get-then-reserve hoặc separate ack; không reopen RideCreated.
+
+No candidate là processed `:no_candidate`: Ride MATCHING/nil, không tạo Offer/event mới, không charge retry failure. `attempts` vẫn đếm lần processing thành công. Future redispatch phải có event ID mới; chưa tự tìm liên tục khi Driver available/di chuyển. Pending Offer vẫn giữ Driver dù deadline đã qua, cho tới explicit expiration command tương lai. Distinct dispatch event cho consistent assigned Ride được ack ignored; terminal Ride không mở lại. Contradictory ownership fail permanently, giữ nguyên business records. Unknown event types vẫn pending, không vào actionable scan/retry accounting.
 
 Definite worker exceptions/retryable results được ghi bằng `fail_event(server, id, observed_attempts, :processing_failed)`. Atomic version check chống duplicate failure reports; malformed versions trả `:invalid_attempt`, stale versions trả `:stale_attempt`, unsupported/nonpending records trả `:not_actionable`. Tối đa 3 attempts; backoff 1000ms rồi 2000ms, sau đó FAILED retained. Retry eligibility dùng owner monotonic clock, injectable tại startup cho tests bằng nonblocking fake clock. Metadata defaults: attempts 0, next_attempt_at nil (immediate). Processed records có outcome; failed records có last_error. Event không cần timestamp.
 
 Timeout là uncertain: reread authoritative record trước retry, không ghi definite failure vì timeout. Dispatcher crash trước commit để lại pending work; crash sau commit không lặp transition hoặc successor. Dispatcher monitor owner và reconnect registered name sau restart; owner crash làm mất toàn bộ RAM. Không claim durable/exactly-once delivery. Production dispatcher gọi Store; optional worker processing function ở dispatcher chỉ là fault-injection seam, không phải mutation callback của owner.
 
-AC-10 vẫn PARTIAL: actual asynchronous RideCreated consumption đã có, nhưng Driver matching/offer workflow chưa có. Accepted ADR-002 không đổi. Trade-offs: single mailbox, event scans/sorting, retained history và volatile single-node state. Future broker/ETS không thuộc 10A.
+AC-10 VERIFIED theo flow Ride Created → async Dispatch Event → matching cùng README giải thích async/duplicates/failure. Điều này không hoàn tất AC-05 lifecycle hoặc accepted-Ride AC-09. ADR-001/002/003 giữ nguyên quyết định Accepted; mô tả scope 10A là lịch sử. Trade-offs: một mailbox, O(n) Driver scan, thêm Ride/Offer/history scans, retained memory và volatile single-node state; chưa có benchmark.
 
 ### G2. Timeout và đồng hồ giả lập
 
-**PLANNED application config:** `matching_radius_km = 2.0`, `offer_timeout_ms = 30_000`. Hiện Matcher nhận option `radius_km: 2.0`; chưa có các application config keys hoặc timeout scheduler này.
+**IMPLEMENTED application config:** `:ride_dispatch, :matching_radius_km` default 2.0 (nonnegative number), `:offer_timeout_ms` default 30_000 (positive integer). Application truyền vào StateServer; tests truyền startup options riêng. Invalid policy/clock results bị từ chối lúc startup. Trusted nonblocking `clock:` trả monotonic integer milliseconds, negative values hợp lệ. Clock lỗi runtime không đổi business state; discovery trả []/nil để recovery scan không busy-loop.
 
-Mỗi pending offer có `offerId` và deadline. Có thể dùng `Process.send_after` để lên lịch kiểm tra, nhưng timer chỉ là *trigger*, không phải nguồn chân lý: khi timer tới, StateServer kiểm tra **offer còn là current pending offer và `now >= expiresAt`** rồi mới thay đổi. AcceptOffer cũng kiểm tra deadline ngay khi nhận command, không dựa vào timer chạy đúng giờ.
+Ngay trước Offer construction sau matching/validation, owner đọc `reservation_now_ms` rồi tính `expires_at_ms = reservation_now_ms + offer_timeout_ms`; không dùng event creation time hoặc caller timestamp. `Dispatch.Offer.expired?/2` dùng `now_ms >= expires_at_ms`, đã test before/at/after deadline và delayed pending work. Integer arithmetic không bị fixed-width overflow; monotonic values không có ý nghĩa qua VM restart. Chưa có timeout scheduler hoặc expiration command.
 
-Dùng clock injection (`Clock.now_ms()` hoặc tham số `now`) trong domain tests; **không sleep 30 giây**. Nếu timer cũ cho offer đã accepted/cancelled/rejected được gửi đến thì phải bỏ qua.
+**PLANNED lifecycle:** timer (`Process.send_after`) chỉ là trigger; owner phải kiểm tra Offer ID vẫn current, status pending và `now_ms >= expires_at_ms` trước expiration. AcceptOffer tương lai kiểm tra deadline ngay trong command. Deadline qua không tự giải phóng Driver.
 
-Khi expire, đóng Offer, Driver `OFFERED->AVAILABLE`, Ride `DRIVER_ASSIGNED->MATCHING`, xóa `assignedDriverId`, loại driver khỏi các lần matching tiếp theo của Ride và phát `DispatchRequested`.
+Dùng owner `clock:` injection và fake monotonic time trong tests; **không sleep 30 giây**. Nếu timer cũ cho offer đã accepted/cancelled/rejected được gửi đến thì phải bỏ qua.
+
+**PLANNED:** Khi expire, đóng Offer, Driver `OFFERED->AVAILABLE`, Ride `DRIVER_ASSIGNED->MATCHING`, xóa assignment/current Offer, giữ exclusion history và enqueue DispatchRequested có identity mới.
 
 ## H. API contract để reviewer thử đúng đề
 
@@ -426,7 +431,7 @@ Unit tests dùng `ExUnit.Case, async: true` với pure functions. Các GenServer
 
 **IMPLEMENTED HTTP isolation:** `DriverController` và `RideController` đọc trusted private metadata `conn.private[:dispatch_store]`, mặc định owner tên `RideDispatch.Dispatch.StateServer`. HTTP tests dùng PID của supervised instance riêng, tạo conn mới cho mỗi request; không đổi global Application env và không tạo StateServer theo request. `Plug.Parsers` tại Endpoint xử lý raw JSON; `assert_error_sent` kiểm tra malformed JSON syntax thật, khác với parsed JSON có invalid fields.
 
-**Giới hạn VERIFIED:** Driver HTTP 409 dùng response-only protocol fixture, không phải real `OFFERED`/`BUSY` lifecycle. Store callback tests kiểm tra rejection với standalone values vì seeds hiện từ chối các states này; không bypass live state. Chưa có end-to-end offer/reservation safety, hoặc test nối latest Store location sang Matcher. Concurrent Driver updates chứng minh Store coordination, không chứng minh AC-09. ADR-001/002 vẫn Accepted; mô tả Phase B trong ADR-002 là snapshot lịch sử, không thay thế tiến độ hiện tại.
+**VERIFIED 10B:** 22 reservation tests, 9 reservation-dispatcher tests và HTTP test nối Driver updates → POST → async reservation → GET/current, POST/original replay và real OFFERED HTTP 409. Callback synthetic fixtures cover distinct event IDs, history và terminal/contradictory state; không phải live lifecycle evidence. Test BUSY HTTP cũ vẫn là protocol fixture. Live two-Ride concurrency chứng minh pending reservation, chưa chứng minh accepted lifecycle. Timeout paths dùng controlled timeout signals quanh real Store calls, không phải elapsed network timeout. Full suite 165 passed; focused regressions 153 passed. ADR-001/002/003 Accepted; snapshots lịch sử không thay thế tiến độ hiện tại.
 
 ```bash
 mix format
@@ -451,7 +456,7 @@ refactor(dispatch): isolate pure domain reducer
 
 ## J. Documentation bắt buộc & Scaling
 
-Danh sách dưới đây là deliverables mục tiêu. Hiện `README.md` đã mô tả Ride creation/retrieval, idempotency và volatile-state limitations, nhưng chưa đủ toàn bộ deliverables; `docs/architecture.md` và `docs/sequence-diagram.md` là file rỗng. Hai ADR đã Accepted; không suy ra architecture/sequence deliverables hoàn tất từ sự tồn tại của file. Các khoảng trống này vẫn **PLANNED**.
+Danh sách dưới đây là deliverables mục tiêu. Hiện `README.md` đã mô tả Ride creation/retrieval, idempotency và volatile-state limitations, nhưng chưa đủ toàn bộ deliverables; `docs/architecture.md` và `docs/sequence-diagram.md` là file rỗng. Ba ADR đã Accepted; không suy ra architecture/sequence deliverables hoàn tất từ sự tồn tại của file. Các khoảng trống này vẫn **PLANNED**.
 
 ```text
 coding-challenge-3/my-team/
@@ -464,7 +469,8 @@ coding-challenge-3/my-team/
     ├── sequence-diagram.md
     └── adr/
         ├── ADR-001-matching.md
-        └── ADR-002-concurrency.md
+        ├── ADR-002-concurrency.md
+        └── ADR-003-event-processing.md
 ```
 
 **README:** prerequisites, setup, `mix deps.get`, `mix test`, `mix phx.server`, seed strategy, 8 API endpoints, curl examples, how to reproduce concurrency test, idempotency, asynchronous semantics and failure handling, known limitations, AI tools usage.

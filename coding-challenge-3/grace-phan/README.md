@@ -64,7 +64,7 @@ domain result), and one pending event together. Event shape:
 No timestamp is required. Ride/Event IDs use distinct prefixes and a VM-wide
 unique counter; uniqueness is not promised across VM restarts. No external I/O,
 message publication, task spawning, or matching occurs in the creation callback.
-Creation only records pending work. The supervised dispatcher now consumes RideCreated asynchronously as described below; Driver matching remains unimplemented and AC-10 incomplete.
+Creation only records pending work. The supervised dispatcher consumes RideCreated and DispatchRequested asynchronously, then atomically reserves an eligible Driver as described below.
 
 The original domain result is stored separately from current Ride state; HTTP
 serialization is not stored. GET reads current state, while POST replay reads the
@@ -75,12 +75,14 @@ retrying with the same key is safe while the owner survives. After owner crash o
 restart, keys, Rides and events are lost; a retry can create a new Ride. This is
 not crash-durable idempotency or a durable transactional outbox. One mailbox
 serializes reads/writes, records grow without eviction, and there are no external
-side-effect transactions or multi-node guarantees. Acceptance and broader lifecycle idempotency, DispatchRequested consumption, reservation and offer workflows remain future features. See [AC traceability](docs/ac-traceability.md) for evidence boundaries.
+side-effect transactions or multi-node guarantees. Acceptance and broader Offer lifecycle idempotency, release and rematching remain future features. See [AC traceability](docs/ac-traceability.md) for evidence boundaries.
 
 
-## Asynchronous event processing (Feature #10A)
+## Asynchronous event processing and reservation (Features #10A/#10B)
 
-One supervised `Dispatch.EventDispatcher` starts after the named StateServer,
+Asynchronous processing keeps matching outside the HTTP response lifecycle and
+lets pending work survive request completion or dispatcher restart while its owner
+remains alive. One supervised `Dispatch.EventDispatcher` starts after the named StateServer,
 independently of HTTP. Store operations accept an explicit PID/name for isolated
 tests. After a successful create call, the Store wrapper requests a wake-up hint;
 creation's atomic callback does not publish events or spawn tasks. Startup and
@@ -89,8 +91,8 @@ reply. Hints coalesce; only due supported events are selected, one per dispatche
 mailbox turn. A single replaceable timer schedules the next eligible retry or
 recovery scan. Unsupported events cannot cause an immediate rescan loop.
 
-`Store.process_event(server, event_id)` performs this complete transition within
-one callback:
+`Store.process_event(server, event_id)` handles each event in one authoritative
+callback. RideCreated processing installs:
 
 ```text
 RideCreated PROCESSED + Ride MATCHING + one DispatchRequested PENDING
@@ -103,11 +105,48 @@ Ride is acknowledged as ignored without another successor. Known later or
 terminal Ride states are also ignored without changing the Ride. Missing Rides
 or invalid Ride states produce a permanent failed event, without a retry.
 
-`DispatchRequested` has no handler in 10A: it remains pending, unchanged and
-visible through `Store.list_events/1` and `Store.get_event/2`. It is excluded from
-`list_actionable_events/1` and retry scheduling. Feature #10B must introduce its
-handler using the same atomic processing command, preserving these pending
-records rather than reopening acknowledged RideCreated events.
+DispatchRequested processing reuses the pure Matcher and both State Machines,
+selecting from current authoritative Driver coordinates/availability. It installs:
+
+```text
+Ride DRIVER_ASSIGNED + assignedDriverId + currentOfferId
+Driver OFFERED + one Offer PENDING + DispatchRequested PROCESSED
+```
+
+Selection, ownership checks, reservation and acknowledgement share one callback.
+Existing pending #10A DispatchRequested events are actionable without reopening
+RideCreated. Unknown event types remain pending and excluded from retry scans.
+Repeated processed events change nothing; distinct events for a consistently
+assigned Ride are acknowledged as ignored. Missing/invalid Rides, invalid pickup,
+and contradictory ownership permanently fail the event without changing business
+records. A Driver's status alone cannot override conflicting Ride/Offer ownership.
+
+No candidate is a processed `:no_candidate` outcome: the Ride stays MATCHING with
+nil assignment/current Offer, and no Offer or redispatch is created. Processing
+attempts still increment; no infrastructure retry failure is charged. Future
+legitimate redispatch must enqueue a new event identity, never reopen a processed
+one. There is no automatic search after availability/location changes.
+
+Offers retain `id`, `rideId`, `driverId`, `status: :pending`, `created_at_ms` and
+`expires_at_ms`. IDs use an independent `offer-` prefix and VM-wide unique counter.
+`Store.get_offer/2` and `Store.list_offers/1` are read-only queries; the latter sorts
+by ID. Retained rejected/expired Offer history supplies permanent Ride-scoped
+exclusions; generating those outcomes belongs to future lifecycle commands.
+
+Application configuration `:ride_dispatch, :matching_radius_km` defaults to 2.0
+(nonnegative number); `:offer_timeout_ms` defaults to 30_000 (positive integer).
+Invalid configuration/clock results reject owner startup. Tests inject these as
+StateServer options with a trusted, nonblocking monotonic-millisecond clock.
+Reservation reads time immediately before Offer construction, after selection:
+`expires_at_ms = reservation_now_ms + offer_timeout_ms`.
+`Dispatch.Offer.expired?/2` uses `now_ms >= expires_at_ms`. Integer arithmetic does
+not impose fixed-width overflow. Negative monotonic values are valid; timestamps
+are not meaningful across VM restarts. Invalid runtime clock readings leave
+business state unchanged; discovery returns no actionable work until a later scan.
+
+A deadline passing does not close a pending Offer or release its Driver. Only a
+future explicit lifecycle command may do so. There is no expiration scheduler,
+acceptance/rejection, cancellation, completion or active rematching yet.
 
 There are no claims, leases, or separate acknowledgements. Event records remain
 in the authoritative `pending_events` map after processing/failure. Attempt count
@@ -135,11 +174,20 @@ Tests use isolated owners/dispatchers, fake monotonic time, process barriers and
 telemetry message assertions without sleeps. Run:
 
 ```sh
-mix test test/ride_dispatch/dispatch/event_store_test.exs test/ride_dispatch/dispatch/event_dispatcher_test.exs test/ride_dispatch_web/controllers/ride_controller_test.exs
+mix test test/ride_dispatch/dispatch/reservation_test.exs test/ride_dispatch/dispatch/reservation_dispatcher_test.exs test/ride_dispatch/dispatch/event_store_test.exs test/ride_dispatch/dispatch/event_dispatcher_test.exs test/ride_dispatch_web/controllers/ride_controller_test.exs
 ```
 
-AC-08 remains partial (Driver acceptance and broader lifecycle idempotency),
-AC-09 still requires reservation and two different competing Rides, and AC-10
-remains partial until asynchronous Driver matching and its failure/duplicate
-handling are implemented. Event scans and retained records still contend for
-one mailbox and grow in memory; no throughput or durable recovery is promised.
+The reservation tests barrier-release two different Ride callers against one Driver
+for 20 runs and inspect both Rides, Driver, all Offers and Events. Another test
+competes a real dispatcher with a Store caller; the dispatcher itself remains a
+single consumer. Synthetic callback fixtures cover distinct event IDs for one Ride,
+terminal/inconsistent state and rejected/expired history; these are explicitly
+separate from live integration evidence. Timeout tests use controlled timeout
+signals before/after real Store processing, rather than an elapsed network timeout.
+
+Feature #10B verification: 165 full-suite tests passed. AC-03, AC-04 and AC-10 are
+VERIFIED against their specified clauses. AC-08 and AC-09 remain PARTIAL: accepted
+Ride lifecycle/idempotency and its concurrency evidence remain future work.
+Pending-offer reservation is proven; no accepted-Ride safety completion is claimed.
+Event, Driver, Ride and history scans contend for one mailbox and retained records
+grow in memory; no throughput, cross-node consistency or durable recovery is promised.
