@@ -3,6 +3,7 @@ defmodule RideDispatch.Dispatch.StateServer do
   use GenServer
 
   alias RideDispatch.Location
+  alias RideDispatch.Drivers.StateMachine
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
@@ -49,6 +50,25 @@ defmodule RideDispatch.Dispatch.StateServer do
           {:reply, {:ok, updated}, new_state}
         else
           {:reply, {:error, :invalid_coordinates}, state}
+        end
+    end
+  end
+
+  def handle_call({:set_driver_availability, id, available?}, _from, state) do
+    case Map.fetch(state.drivers, id) do
+      :error ->
+        {:reply, :not_found, state}
+
+      {:ok, driver} ->
+        action = if available?, do: :enable_availability, else: :disable_availability
+
+        case StateMachine.transition(driver, action) do
+          {:ok, updated} ->
+            new_state = %{state | drivers: Map.put(state.drivers, id, updated)}
+            {:reply, {:ok, updated}, new_state}
+
+          {:error, _reason} = error ->
+            {:reply, error, state}
         end
     end
   end

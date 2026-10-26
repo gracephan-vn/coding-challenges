@@ -16,6 +16,17 @@ defmodule RideDispatch.Dispatch.Store do
 
   # Commands
   @doc """
+  Enables (`true`) or disables (`false`) availability atomically through the
+  Driver State Machine. Repeated requests succeed unchanged.
+
+  Returns `{:ok, driver}`, `:not_found`, or the State Machine's error tuple.
+  Other driver fields are preserved; rejected transitions leave state unchanged.
+  """
+  def set_driver_availability(server, driver_id, available?) do
+    GenServer.call(server, {:set_driver_availability, driver_id, available?})
+  end
+
+  @doc """
   Atomically updates both coordinates, preserving all other driver fields.
 
   Returns `{:ok, driver}`, `:not_found`, or `{:error, :invalid_coordinates}`.
