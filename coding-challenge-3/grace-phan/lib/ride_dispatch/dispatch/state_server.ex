@@ -188,6 +188,9 @@ defmodule RideDispatch.Dispatch.StateServer do
           event.status != :pending or event.type not in [:ride_created, :dispatch_requested] ->
             {:reply, {:error, :unsupported_event}, state}
 
+          not valid_event?(event, id) ->
+            permanent_failure(state, event, :invalid_event)
+
           not eligible?(event, state.clock.()) ->
             {:reply, {:error, {:retry_at, event.next_attempt_at}}, state}
 
@@ -289,22 +292,91 @@ defmodule RideDispatch.Dispatch.StateServer do
   end
 
   defp process_dispatch_requested(event, state) do
-    ride = state.rides[event.rideId]
+    case Map.fetch(state.rides, event.rideId) do
+      :error ->
+        permanent_failure(state, event, :ride_not_found)
 
+      {:ok, %{id: id, status: :matching} = ride} when id == event.rideId ->
+        if is_nil(Map.get(ride, :assignedDriverId)) and is_nil(Map.get(ride, :currentOfferId)) and
+             not Enum.any?(active_offers(state), &(&1.rideId == ride.id)) do
+          match_driver(event, ride, state)
+        else
+          permanent_failure(state, event, :inconsistent_ownership)
+        end
+
+      {:ok, %{status: status} = ride} when status in [:driver_assigned, :driver_accepted] ->
+        if consistent_assignment?(ride, state) do
+          {:reply, {:ok, :ignored}, put_event(state, processed(event, :already_assigned))}
+        else
+          permanent_failure(state, event, :inconsistent_ownership)
+        end
+
+      {:ok, %{status: status}} when status in [:cancelled, :completed] ->
+        {:reply, {:ok, :ignored}, put_event(state, processed(event, :incompatible_ride_state))}
+
+      {:ok, _invalid} ->
+        permanent_failure(state, event, :invalid_state)
+    end
+  end
+
+  defp match_driver(event, ride, state) do
     exclusions =
       state.offers
       |> Map.values()
       |> Enum.filter(&(&1.rideId == ride.id and &1.status in [:rejected, :expired]))
       |> Enum.map(& &1.driverId)
 
-    case Matcher.nearest(ride.pickup, Map.values(state.drivers),
+    case Matcher.nearest(Map.get(ride, :pickup), Map.values(state.drivers),
            radius_km: state.matching_radius_km,
            excluded_driver_ids: exclusions
          ) do
-      {:ok, driver} -> reserve(event, ride, driver, state)
-      :none -> {:reply, {:ok, :processed}, put_event(state, processed(event, :no_candidate))}
-      {:error, reason} -> permanent_failure(state, event, reason)
+      {:ok, driver} ->
+        if Enum.any?(active_offers(state), &(&1.driverId == driver.id)) or
+             Enum.any?(active_rides(state), &(&1.assignedDriverId == driver.id)) do
+          permanent_failure(state, event, :inconsistent_ownership)
+        else
+          reserve(event, ride, driver, state)
+        end
+
+      :none ->
+        {:reply, {:ok, :processed}, put_event(state, processed(event, :no_candidate))}
+
+      {:error, reason} ->
+        permanent_failure(state, event, reason)
     end
+  end
+
+  defp active_offers(state),
+    do: state.offers |> Map.values() |> Enum.filter(&(&1.status in [:pending, :accepted]))
+
+  defp active_rides(state),
+    do:
+      state.rides
+      |> Map.values()
+      |> Enum.filter(&(&1.status in [:driver_assigned, :driver_accepted]))
+
+  defp consistent_assignment?(ride, state) do
+    offer = Map.get(state.offers, Map.get(ride, :currentOfferId))
+    driver = Map.get(state.drivers, Map.get(ride, :assignedDriverId))
+
+    case {ride.status, driver, offer} do
+      {:driver_assigned, %{status: :offered, id: driver_id},
+       %{id: offer_id, status: :pending, rideId: ride_id, driverId: driver_id}} ->
+        unique_assignment?(ride, driver_id, offer_id, ride_id, state)
+
+      {:driver_accepted, %{status: :busy, id: driver_id},
+       %{id: offer_id, status: :accepted, rideId: ride_id, driverId: driver_id}} ->
+        unique_assignment?(ride, driver_id, offer_id, ride_id, state)
+
+      _inconsistent ->
+        false
+    end
+  end
+
+  defp unique_assignment?(ride, driver_id, offer_id, ride_id, state) do
+    ride.id == ride_id and ride.assignedDriverId == driver_id and ride.currentOfferId == offer_id and
+      Enum.count(active_offers(state), &(&1.rideId == ride_id or &1.driverId == driver_id)) == 1 and
+      Enum.count(active_rides(state), &(&1.assignedDriverId == driver_id)) == 1
   end
 
   defp reserve(event, ride, driver, state) do
@@ -363,6 +435,11 @@ defmodule RideDispatch.Dispatch.StateServer do
     do: %{state | pending_events: Map.put(state.pending_events, event.eventId, event)}
 
   defp supported_pending?(event), do: event.type == :ride_created and event.status == :pending
+
+  defp valid_event?(%{eventId: id, rideId: ride_id}, id),
+    do: is_binary(ride_id) and ride_id != ""
+
+  defp valid_event?(_event, _id), do: false
 
   defp eligible?(event, now),
     do: is_nil(Map.get(event, :next_attempt_at)) or event.next_attempt_at <= now
