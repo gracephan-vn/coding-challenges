@@ -33,6 +33,34 @@ defmodule RideDispatchWeb.RideController do
     end
   end
 
+  def accept_offer(conn, _params) do
+    if conn.body_params == %{} do
+      case Rides.accept_offer(
+             server(conn),
+             conn.path_params["rideId"],
+             conn.path_params["driverId"]
+           ) do
+        {:ok, original_ride} ->
+          json(conn, %{data: public_ride(original_ride)})
+
+        :not_found ->
+          error(conn, 404, "Not Found")
+
+        {:error, :invalid_request} ->
+          error(conn, 400, "Bad Request")
+
+        {:error, reason}
+        when reason in [:wrong_driver, :offer_expired, :invalid_transition, :ambiguous_offer] ->
+          error(conn, 409, "Conflict")
+
+        {:error, _invariant_or_clock_failure} ->
+          error(conn, 500, "Internal Server Error")
+      end
+    else
+      error(conn, 400, "Bad Request")
+    end
+  end
+
   defp server(conn), do: Map.get(conn.private, :dispatch_store, StateServer)
 
   defp error(conn, status, detail),

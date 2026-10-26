@@ -4,4 +4,5 @@ defmodule RideDispatch.Rides do
 
   defdelegate create_ride(server, key, request), to: Store
   defdelegate get_ride(server, ride_id), to: Store
+  defdelegate accept_offer(server, ride_id, driver_id), to: Store
 end
