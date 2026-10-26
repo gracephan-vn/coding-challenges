@@ -32,6 +32,7 @@ defmodule RideDispatch.Dispatch.ExpirationScheduler do
            expire: Keyword.get(opts, :expire, &Store.expire_offer/2),
            reminder: reminder,
            diagnostics: %{},
+           retries: %{},
            last_now: nil,
            owner: nil,
            monitor: nil,
@@ -70,7 +71,7 @@ defmodule RideDispatch.Dispatch.ExpirationScheduler do
           state = %{
             state
             | last_now: snapshot.now_ms,
-              diagnostics: Map.delete(state.diagnostics, :global_clock)
+              diagnostics: state.diagnostics
           }
 
           scan_snapshot(state, snapshot)
@@ -89,7 +90,11 @@ defmodule RideDispatch.Dispatch.ExpirationScheduler do
 
     state = %{
       state
-      | diagnostics: Map.filter(state.diagnostics, fn {id, _} -> MapSet.member?(present, id) end)
+      | diagnostics:
+          Map.filter(state.diagnostics, fn {id, _} ->
+            id == :global_clock or MapSet.member?(present, id)
+          end),
+        retries: Map.filter(state.retries, fn {id, _} -> MapSet.member?(present, id) end)
     }
 
     state =
@@ -97,20 +102,21 @@ defmodule RideDispatch.Dispatch.ExpirationScheduler do
         diagnose(acc, invalid.offer_id, invalid.reason, invalid.fingerprint, snapshot.now_ms)
       end)
 
-    candidates = Enum.filter(snapshot.pending, &eligible?(state, &1, snapshot.now_ms))
-
-    case Enum.find(candidates, &(&1.expires_at_ms <= snapshot.now_ms)) do
+    case Enum.find(
+           snapshot.pending,
+           &(candidate_at(state, &1, snapshot.now_ms) <= snapshot.now_ms)
+         ) do
       nil ->
         delay =
-          candidates
-          |> Enum.map(&max(1, &1.expires_at_ms - snapshot.now_ms))
+          snapshot.pending
+          |> Enum.map(&max(1, candidate_at(state, &1, snapshot.now_ms) - snapshot.now_ms))
           |> Enum.min(fn -> state.interval end)
           |> min(state.interval)
 
         idle(state, delay)
 
       candidate ->
-        result = state.expire.(state.owner, candidate.offer_id)
+        result = invoke(state, candidate.offer_id)
 
         :telemetry.execute([:ride_dispatch, :expiration, :result], %{}, %{
           server: state.store,
@@ -121,11 +127,11 @@ defmodule RideDispatch.Dispatch.ExpirationScheduler do
         })
 
         case result do
-          {:error, :inconsistent_ownership} ->
+          {:error, reason} when reason in [:inconsistent_ownership, :invalid_request] ->
             state
             |> diagnose(
               candidate.offer_id,
-              :inconsistent_ownership,
+              reason,
               candidate.fingerprint,
               snapshot.now_ms
             )
@@ -136,11 +142,22 @@ defmodule RideDispatch.Dispatch.ExpirationScheduler do
             |> diagnose(:global_clock, :invalid_clock, nil, snapshot.now_ms)
             |> idle(state.interval)
 
-          _ ->
-            delay =
-              if match?({:ok, _}, result) or result == :not_found, do: 0, else: state.interval
+          {:ok, _} ->
+            schedule(%{state | retries: Map.delete(state.retries, candidate.offer_id)}, 0)
 
-            schedule(state, delay)
+          :not_found ->
+            schedule(%{state | retries: Map.delete(state.retries, candidate.offer_id)}, 0)
+
+          {:error, {:not_due, deadline}} when is_integer(deadline) ->
+            state |> defer(candidate, snapshot.now_ms, deadline) |> schedule(0)
+
+          {:error, reason} when reason in [:uncertain, :owner_unavailable] ->
+            state
+            |> defer(candidate, snapshot.now_ms, snapshot.now_ms + state.interval)
+            |> schedule(0)
+
+          _unexpected_or_retryable ->
+            state |> retry_failure(candidate, snapshot.now_ms) |> schedule(0)
         end
     end
   end
@@ -164,17 +181,80 @@ defmodule RideDispatch.Dispatch.ExpirationScheduler do
   end
 
   defp clear_owner(state),
-    do: %{state | owner: nil, monitor: nil, diagnostics: %{}, last_now: nil}
+    do: %{state | owner: nil, monitor: nil, diagnostics: %{}, retries: %{}, last_now: nil}
 
-  defp eligible?(state, candidate, now) do
-    case Map.get(state.diagnostics, candidate.offer_id) do
-      %{reason: :inconsistent_ownership, fingerprint: fp, at: at}
-      when fp == candidate.fingerprint ->
-        now >= at + state.reminder
+  defp candidate_at(state, candidate, now) do
+    blocked_until =
+      case Map.get(state.diagnostics, candidate.offer_id) do
+        %{reason: reason, fingerprint: fp, at: at}
+        when reason in [:inconsistent_ownership, :invalid_request] and fp == candidate.fingerprint ->
+          at + state.reminder
 
-      _ ->
-        true
+        _ ->
+          now
+      end
+
+    retry_at =
+      case Map.get(state.retries, candidate.offer_id) do
+        %{fingerprint: fp, next_at: at} when fp == candidate.fingerprint -> at
+        _ -> now
+      end
+
+    max(candidate.expires_at_ms, max(blocked_until, retry_at))
+  end
+
+  defp invoke(state, id) do
+    try do
+      state.expire.(state.owner, id)
+    rescue
+      _technical_failure -> {:error, :retryable}
+    catch
+      :exit, {:timeout, _call} ->
+        # Timeout does not cancel a command. Reconcile against this same owner.
+        try do
+          case Store.get_offer(state.owner, id) do
+            {:ok, %{status: :pending}} -> {:error, :uncertain}
+            {:ok, _closed} -> Store.expire_offer(state.owner, id)
+            :not_found -> :not_found
+          end
+        catch
+          :exit, _ -> {:error, :uncertain}
+        end
+
+      :exit, _owner_unavailable ->
+        {:error, :owner_unavailable}
     end
+  end
+
+  defp defer(state, candidate, _now, at) do
+    previous = Map.get(state.retries, candidate.offer_id, %{})
+
+    entry = %{
+      fingerprint: candidate.fingerprint,
+      attempts: Map.get(previous, :attempts, 0),
+      next_at: at
+    }
+
+    %{state | retries: Map.put(state.retries, candidate.offer_id, entry)}
+  end
+
+  defp retry_failure(state, candidate, now) do
+    previous = Map.get(state.retries, candidate.offer_id, %{})
+
+    count =
+      if Map.get(previous, :fingerprint) == candidate.fingerprint and
+           Map.get(previous, :attempts, 0) < 3, do: Map.get(previous, :attempts, 0), else: 0
+
+    attempts = count + 1
+    delay = if attempts >= 3, do: state.reminder, else: 1000 * Integer.pow(2, attempts - 1)
+
+    state =
+      if attempts >= 3,
+        do: diagnose(state, candidate.offer_id, :retry_exhausted, candidate.fingerprint, now),
+        else: state
+
+    entry = %{fingerprint: candidate.fingerprint, attempts: attempts, next_at: now + delay}
+    %{state | retries: Map.put(state.retries, candidate.offer_id, entry)}
   end
 
   defp diagnose(state, id, reason, fingerprint, now) do
