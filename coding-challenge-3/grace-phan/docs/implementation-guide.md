@@ -442,7 +442,7 @@ refactor(dispatch): isolate pure domain reducer
 
 ## J. Documentation bắt buộc & Scaling
 
-Danh sách dưới đây là deliverables mục tiêu. Hiện `README.md` còn là Phoenix boilerplate; `docs/architecture.md` và `docs/sequence-diagram.md` là file rỗng. Hai ADR đã Accepted; không suy ra architecture/sequence deliverables hoàn tất từ sự tồn tại của file. Các khoảng trống này vẫn **PLANNED**.
+Danh sách dưới đây là deliverables mục tiêu. Hiện `README.md` đã mô tả Ride creation/retrieval, idempotency và volatile-state limitations, nhưng chưa đủ toàn bộ deliverables; `docs/architecture.md` và `docs/sequence-diagram.md` là file rỗng. Hai ADR đã Accepted; không suy ra architecture/sequence deliverables hoàn tất từ sự tồn tại của file. Các khoảng trống này vẫn **PLANNED**.
 
 ```text
 coding-challenge-3/my-team/
