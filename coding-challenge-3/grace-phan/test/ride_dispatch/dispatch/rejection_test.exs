@@ -117,6 +117,136 @@ defmodule RideDispatch.Dispatch.RejectionTest do
     assert :sys.get_state(server) == state
   end
 
+  test "lost-result and concurrent retries return the immutable matching receipt exactly once" do
+    {server, ride, offer, clock} = reserved()
+    :atomics.put(clock, 1, 7)
+    # Completed call, discarded response: retry must consult authoritative evidence.
+    assert Task.await(
+             Task.async(fn ->
+               Store.reject_offer(server, ride.id, "A")
+               :lost
+             end)
+           ) == :lost
+
+    state = :sys.get_state(server)
+    result = state.offers[offer.id].rejection_receipt.original_result
+    :atomics.put(clock, 1, 100_000)
+
+    assert competing(List.duplicate(fn -> Store.reject_offer(server, ride.id, "A") end, 8)) ==
+             List.duplicate({:ok, result}, 8)
+
+    assert :sys.get_state(server) == state
+    assert Enum.count(Store.list_events(server), &(&1.eventId == "redispatch-" <> offer.id)) == 1
+  end
+
+  test "old rejection replay never changes replacement acceptance or released Driver reuse" do
+    {server, ride, offer, _} = reserved()
+    assert {:ok, original} = Store.reject_offer(server, ride.id, "A")
+    assert {:ok, _} = Store.set_driver_availability(server, "B", true)
+    assert {:ok, :processed} = Store.process_event(server, "redispatch-" <> offer.id)
+    assert {:ok, %{assignedDriverId: "B"}} = Store.accept_offer(server, ride.id, "B")
+    {:ok, other} = Store.create_ride(server, "other", body())
+    created = Enum.find(Store.list_events(server), &(&1.rideId == other.id))
+    assert {:ok, :processed} = Store.process_event(server, created.eventId)
+    assert {:ok, :processed} = Store.process_event(server, "dispatch-" <> other.id)
+    assert {:ok, %{assignedDriverId: "A"}} = Store.accept_offer(server, other.id, "A")
+    state = :sys.get_state(server)
+    assert Store.reject_offer(server, ride.id, "A") == {:ok, original}
+    assert :sys.get_state(server) == state
+    assert state.drivers["A"].status == :busy
+    assert state.drivers["B"].status == :busy
+  end
+
+  test "synthetic receipt and linked-event corruption cannot authorize replay" do
+    {server, ride, offer, _} = reserved()
+    assert {:ok, original} = Store.reject_offer(server, ride.id, "A")
+    state = :sys.get_state(server)
+    event_id = "redispatch-" <> offer.id
+    rejected = state.offers[offer.id]
+    receipt = rejected.rejection_receipt
+
+    broken_receipts = [
+      nil,
+      %{},
+      %{receipt | offerId: "wrong"},
+      %{receipt | rideId: "wrong"},
+      %{receipt | driverId: "wrong"},
+      %{receipt | rejected_at_ms: -1},
+      %{receipt | redispatch_event_id: "wrong"},
+      %{receipt | original_result: %{original | status: :driver_assigned}},
+      %{receipt | original_result: Map.delete(original, :currentOfferId)},
+      %{receipt | original_result: %{original | pickup: %{latitude: 1, longitude: 1}}}
+    ]
+
+    variants =
+      Enum.map(broken_receipts, &put_in(state.offers[offer.id].rejection_receipt, &1)) ++
+        [
+          put_in(state.offers[offer.id].id, "wrong"),
+          put_in(state.offers[offer.id].status, :pending),
+          put_in(state.offers[offer.id], Map.put(rejected, :accepted_at_ms, 0)),
+          put_in(state.offers[offer.id], Map.delete(rejected, :rejection_receipt)),
+          %{state | pending_events: Map.delete(state.pending_events, event_id)},
+          put_in(state.pending_events[event_id].eventId, "wrong"),
+          put_in(state.pending_events[event_id].rideId, "wrong"),
+          put_in(state.pending_events[event_id].type, :ride_created),
+          put_in(state.pending_events[event_id].status, :unknown)
+        ]
+
+    for input <- variants do
+      assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+               StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
+    end
+
+    for status <- [:pending, :processed, :failed] do
+      input = put_in(state.pending_events[event_id].status, status)
+      input = %{input | clock: fn -> raise "replay must not read time" end}
+
+      assert {:reply, {:ok, ^original}, ^input} =
+               StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
+    end
+  end
+
+  test "synthetic terminal replay compatibility and ambiguous same-pair history" do
+    {server, ride, offer, _} = reserved()
+    assert {:ok, original} = Store.reject_offer(server, ride.id, "A")
+    state = :sys.get_state(server)
+
+    for status <- [:cancelled, :completed] do
+      # Future lifecycle compatibility only, not live cancellation/completion coverage.
+      input = put_in(state.rides[ride.id].status, status)
+
+      assert {:reply, {:ok, ^original}, ^input} =
+               StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
+    end
+
+    input = put_in(state.offers["another"], %{state.offers[offer.id] | id: "another"})
+
+    assert {:reply, {:error, :ambiguous_offer}, ^input} =
+             StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
+  end
+
+  defp competing(functions) do
+    parent = self()
+
+    tasks =
+      Enum.map(functions, fn fun ->
+        Task.async(fn ->
+          send(parent, {:ready, self()})
+
+          receive do
+            :go -> fun.()
+          end
+        end)
+      end)
+
+    for _ <- tasks do
+      assert_receive {:ready, _}, 1000
+    end
+
+    Enum.each(tasks, &send(&1.pid, :go))
+    Enum.map(tasks, &Task.await/1)
+  end
+
   defp reserved do
     clock = :atomics.new(1, [])
 
