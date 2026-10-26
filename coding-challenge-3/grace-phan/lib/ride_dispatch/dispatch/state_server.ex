@@ -42,25 +42,16 @@ defmodule RideDispatch.Dispatch.StateServer do
 
   @impl true
   def handle_call({:accept_offer, ride_id, driver_id}, _from, state) do
-    ride = state.rides[ride_id]
-    driver = state.drivers[driver_id]
-    offer = state.offers[ride.currentOfferId]
-
-    with {:ok, now} <- read_clock(state.clock),
-         {:ok, accepted} <- RideStateMachine.transition(ride, :accept_offer),
-         {:ok, busy} <- StateMachine.transition(driver, :accept_offer) do
-      receipt =
-        Map.merge(offer, %{status: :accepted, accepted_at_ms: now, acceptance_result: accepted})
-
-      updated = %{
-        state
-        | rides: Map.put(state.rides, ride_id, accepted),
-          drivers: Map.put(state.drivers, driver_id, busy),
-          offers: Map.put(state.offers, offer.id, receipt)
-      }
-
-      {:reply, {:ok, accepted}, updated}
+    with :ok <- acceptance_identifiers(ride_id, driver_id),
+         {:ok, ride} <- Map.fetch(state.rides, ride_id),
+         {:ok, driver} <- Map.fetch(state.drivers, driver_id),
+         :ok <- record_identity(ride, ride_id),
+         :ok <- record_identity(driver, driver_id),
+         {:ok, offer} <- current_acceptance_offer(ride, driver, state) do
+      accept_pending(ride, driver, offer, state)
     else
+      :error -> {:reply, :not_found, state}
+      :not_found -> {:reply, :not_found, state}
       {:error, _reason} = error -> {:reply, error, state}
     end
   end
@@ -298,6 +289,64 @@ defmodule RideDispatch.Dispatch.StateServer do
         else: state.event_subscribers
 
     {:noreply, %{state | event_subscribers: subscribers}}
+  end
+
+  defp acceptance_identifiers(ride_id, driver_id) do
+    if Enum.all?([ride_id, driver_id], &(is_binary(&1) and &1 != "" and String.valid?(&1))),
+      do: :ok,
+      else: {:error, :invalid_request}
+  end
+
+  defp record_identity(%{id: id}, id), do: :ok
+  defp record_identity(_record, _id), do: {:error, :inconsistent_ownership}
+
+  defp current_acceptance_offer(ride, driver, state) do
+    case Map.fetch(state.offers, Map.get(ride, :currentOfferId)) do
+      :error ->
+        if Map.get(ride, :status) == :driver_assigned or
+             not is_nil(Map.get(ride, :currentOfferId)),
+           do: {:error, :inconsistent_ownership},
+           else: :not_found
+
+      {:ok, %{id: id, rideId: ride_id, driverId: driver_id, status: :pending} = offer} ->
+        cond do
+          id != Map.get(ride, :currentOfferId) or ride_id != ride.id or
+              driver_id != Map.get(ride, :assignedDriverId) ->
+            {:error, :inconsistent_ownership}
+
+          driver_id != driver.id ->
+            {:error, :wrong_driver}
+
+          not consistent_assignment?(ride, state) ->
+            {:error, :inconsistent_ownership}
+
+          true ->
+            {:ok, offer}
+        end
+
+      {:ok, _invalid} ->
+        {:error, :inconsistent_ownership}
+    end
+  end
+
+  defp accept_pending(ride, driver, offer, state) do
+    with {:ok, now} <- read_clock(state.clock),
+         {:ok, accepted} <- RideStateMachine.transition(ride, :accept_offer),
+         {:ok, busy} <- StateMachine.transition(driver, :accept_offer) do
+      receipt =
+        Map.merge(offer, %{status: :accepted, accepted_at_ms: now, acceptance_result: accepted})
+
+      updated = %{
+        state
+        | rides: Map.put(state.rides, ride.id, accepted),
+          drivers: Map.put(state.drivers, driver.id, busy),
+          offers: Map.put(state.offers, offer.id, receipt)
+      }
+
+      {:reply, {:ok, accepted}, updated}
+    else
+      {:error, _reason} = error -> {:reply, error, state}
+    end
   end
 
   defp process_ride_created(event, state) do
