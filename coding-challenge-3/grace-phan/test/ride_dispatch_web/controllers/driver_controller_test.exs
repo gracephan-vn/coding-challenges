@@ -79,6 +79,119 @@ defmodule RideDispatchWeb.DriverControllerTest do
     assert Store.get_driver(other, driver.id) == {:ok, driver}
   end
 
+  test "invalid booleans return JSON 400 and preserve stored data", %{
+    server: server,
+    driver: driver
+  } do
+    for value <- [nil, "true", "false", 0, 1, [], %{}] do
+      conn = request(server, "/drivers/D001/availability", %{"available" => value})
+      assert json_response(conn, 400) == %{"errors" => %{"detail" => "Bad Request"}}
+      assert Store.get_driver(server, driver.id) == {:ok, driver}
+    end
+  end
+
+  test "invalid coordinates return JSON 400 without changing either coordinate", context do
+    %{server: server, driver: driver} = context
+
+    for {latitude, longitude} <- [
+          {91, 0},
+          {-91, 0},
+          {0, 181},
+          {0, -181},
+          {"10", 0},
+          {0, "106"},
+          {nil, 0},
+          {0, true},
+          {[], 0},
+          {0, %{}}
+        ] do
+      conn =
+        request(server, "/drivers/D001/location", %{
+          "latitude" => latitude,
+          "longitude" => longitude
+        })
+
+      assert json_response(conn, 400) == %{"errors" => %{"detail" => "Bad Request"}}
+      assert Store.get_driver(server, driver.id) == {:ok, driver}
+    end
+  end
+
+  test "missing fields and parsed non-object JSON have a consistent 400 response", context do
+    %{server: server, driver: driver} = context
+
+    for {endpoint, body} <- [
+          {"availability", %{}},
+          {"availability", %{"availability" => true}},
+          {"availability", []},
+          {"availability", true},
+          {"availability", nil},
+          {"location", %{}},
+          {"location", %{"latitude" => 0}},
+          {"location", %{"longitude" => 0}},
+          {"location", %{"location" => %{"latitude" => 0, "longitude" => 0}}},
+          {"location", [0, 0]},
+          {"location", "coordinates"}
+        ] do
+      conn = request(server, "/drivers/D001/#{endpoint}", body)
+      assert json_response(conn, 400) == %{"errors" => %{"detail" => "Bad Request"}}
+      assert Store.get_driver(server, driver.id) == {:ok, driver}
+    end
+  end
+
+  test "query parameters cannot supply required body fields", %{server: server, driver: driver} do
+    for path <- [
+          "/drivers/D001/availability?available=true",
+          "/drivers/D001/location?latitude=0&longitude=0"
+        ] do
+      assert request(server, path, %{}) |> json_response(400) ==
+               %{"errors" => %{"detail" => "Bad Request"}}
+    end
+
+    assert Store.get_driver(server, driver.id) == {:ok, driver}
+  end
+
+  test "malformed JSON syntax is rendered as 400 by the Endpoint before the controller",
+       context do
+    %{server: server, driver: driver} = context
+
+    for endpoint <- ["availability", "location"] do
+      {400, headers, body} =
+        assert_error_sent 400, fn ->
+          build_conn()
+          |> put_private(:dispatch_store, server)
+          |> put_req_header("content-type", "application/json")
+          |> put_req_header("accept", "application/json")
+          |> put("/drivers/D001/#{endpoint}", ~s({"broken":))
+        end
+
+      assert {"content-type", "application/json; charset=utf-8"} in headers
+      assert Jason.decode!(body) == %{"errors" => %{"detail" => "Bad Request"}}
+      assert Store.get_driver(server, driver.id) == {:ok, driver}
+    end
+  end
+
+  test "Store transition rejection maps a valid availability command to JSON 409", context do
+    # Response-only protocol fixture: no invalid Driver state or live-state backdoor.
+    # Actual offered/busy rejection is covered by Store callback and StateMachine tests.
+    conflict = start_supervised!({__MODULE__.ConflictReply, self()})
+    conn = request(conflict, "/drivers/D001/availability", %{"available" => false})
+    assert json_response(conn, 409) == %{"errors" => %{"detail" => "Conflict"}}
+    assert_receive {:availability_command, "D001", false}
+    assert Store.get_driver(context.server, context.driver.id) == {:ok, context.driver}
+  end
+
+  defmodule ConflictReply do
+    use GenServer
+    def start_link(owner), do: GenServer.start_link(__MODULE__, owner)
+    @impl true
+    def init(owner), do: {:ok, owner}
+    @impl true
+    def handle_call({:set_driver_availability, id, available?}, _from, owner) do
+      send(owner, {:availability_command, id, available?})
+      {:reply, {:error, :invalid_transition}, owner}
+    end
+  end
+
   defp request(server, path, body) do
     build_conn()
     |> put_private(:dispatch_store, server)
