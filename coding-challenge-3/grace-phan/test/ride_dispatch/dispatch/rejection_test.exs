@@ -117,6 +117,102 @@ defmodule RideDispatch.Dispatch.RejectionTest do
     assert :sys.get_state(server) == state
   end
 
+  test "synthetic invalid Offer identifiers and malformed accepted evidence remain controlled invariants" do
+    {server, ride, offer, _} = reserved()
+    state = :sys.get_state(server)
+
+    for id <- [123, "", <<255>>] do
+      input = %{state | offers: %{id => %{offer | id: id}}}
+      input = put_in(input.rides[ride.id].currentOfferId, id)
+
+      assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+               StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
+    end
+
+    assert {:ok, _} = Store.accept_offer(server, ride.id, "A")
+    state = :sys.get_state(server)
+
+    for field <- [:acceptance_result, :accepted_at_ms] do
+      input = put_in(state.offers[offer.id], Map.delete(state.offers[offer.id], field))
+
+      assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+               StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
+    end
+  end
+
+  test "synthetic malformed ownership records cannot crash rejection or partially release a Driver" do
+    {server, ride, _, _} = reserved()
+    state = :sys.get_state(server)
+
+    for input <- [put_in(state.offers["broken"], %{}), put_in(state.rides["broken"], %{})] do
+      assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+               StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
+    end
+  end
+
+  @tag timeout: 10_000
+  test "an actual Store call timeout does not cancel queued rejection; retry recovers its receipt" do
+    {server, ride, offer, _} = reserved()
+    :ok = :sys.suspend(server)
+
+    try do
+      # Deliberately keep the owner suspended through GenServer.call's actual
+      # default timeout. This tests uncertainty, without a sleep-based assertion.
+      task =
+        Task.async(fn ->
+          try do
+            Store.reject_offer(server, ride.id, "A")
+          catch
+            :exit, {:timeout, _} -> :uncertain
+          end
+        end)
+
+      assert Task.await(task, 6000) == :uncertain
+    after
+      :sys.resume(server)
+    end
+
+    assert {:ok, %{status: :matching} = matching} = Store.get_ride(server, ride.id)
+    before = :sys.get_state(server)
+    assert Store.reject_offer(server, ride.id, "A") == {:ok, matching}
+    assert :sys.get_state(server) == before
+    assert before.drivers["A"].status == :available
+    assert before.offers[offer.id].rejection_receipt.original_result == matching
+    assert before.pending_events["redispatch-" <> offer.id].status == :pending
+    assert map_size(before.pending_events) == 3
+  end
+
+  test "synthetic terminal compatibility retains replacement acceptance evidence and optionally its pointer" do
+    {server, ride, offer, _} = reserved()
+    assert {:ok, original} = Store.reject_offer(server, ride.id, "A")
+    assert {:ok, _} = Store.set_driver_availability(server, "B", true)
+    assert {:ok, :processed} = Store.process_event(server, "redispatch-" <> offer.id)
+    assert {:ok, accepted} = Store.accept_offer(server, ride.id, "B")
+    state = :sys.get_state(server)
+
+    for status <- [:completed, :cancelled], clear? <- [false, true] do
+      # Future lifecycle compatibility only: no production lifecycle mutation API.
+      input = put_in(state.rides[ride.id].status, status)
+      input = put_in(input.offers[accepted.currentOfferId].status, status)
+      input = put_in(input.drivers["B"].status, :available)
+
+      input =
+        if clear?,
+          do:
+            put_in(input.rides[ride.id], %{
+              input.rides[ride.id]
+              | assignedDriverId: nil,
+                currentOfferId: nil
+            }),
+          else: input
+
+      assert {:reply, {:ok, ^original}, ^input} =
+               StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
+
+      assert input.offers[accepted.currentOfferId].acceptance_result == accepted
+    end
+  end
+
   test "lost-result and concurrent retries return the immutable matching receipt exactly once" do
     {server, ride, offer, clock} = reserved()
     :atomics.put(clock, 1, 7)

@@ -48,6 +48,7 @@ defmodule RideDispatch.Dispatch.StateServer do
          {:ok, driver} <- Map.fetch(state.drivers, driver_id),
          :ok <- record_identity(ride, ride_id),
          :ok <- record_identity(driver, driver_id),
+         :ok <- rejection_ownership_records(state),
          {:ok, offer} <- resolve_rejection_offer(ride, driver, state) do
       reject_pending(ride, driver, offer, state)
     else
@@ -377,7 +378,9 @@ defmodule RideDispatch.Dispatch.StateServer do
                     {:error, :invalid_transition}
 
                   offer.status == :accepted ->
-                    {:error, :invalid_transition}
+                    if acceptance_receipt?(offer, ride) and consistent_assignment?(ride, state),
+                      do: {:error, :invalid_transition},
+                      else: {:error, :inconsistent_ownership}
 
                   offer.status != :pending or not consistent_assignment?(ride, state) ->
                     {:error, :inconsistent_ownership}
@@ -396,6 +399,34 @@ defmodule RideDispatch.Dispatch.StateServer do
     end
   end
 
+  defp rejection_ownership_records(state) do
+    rides_valid? =
+      Enum.all?(state.rides, fn {key, ride} ->
+        record_identity(ride, key) == :ok and
+          ride.status in [
+            :requested,
+            :matching,
+            :driver_assigned,
+            :driver_accepted,
+            :cancelled,
+            :completed
+          ] and
+          Map.has_key?(ride, :assignedDriverId)
+      end)
+
+    offers_valid? =
+      Enum.all?(state.offers, fn {key, offer} ->
+        record_identity(offer, key) == :ok and
+          offer.status in [:pending, :accepted, :rejected, :expired, :cancelled, :completed] and
+          Enum.all?([:rideId, :driverId], fn field ->
+            id = Map.get(offer, field)
+            is_binary(id) and id != "" and String.valid?(id)
+          end)
+      end)
+
+    if rides_valid? and offers_valid?, do: :ok, else: {:error, :inconsistent_ownership}
+  end
+
   defp rejection_time(offer, clock) do
     with {:ok, now} <- read_clock(clock) do
       if now >= offer.created_at_ms, do: {:ok, now}, else: {:error, :invalid_clock}
@@ -408,9 +439,19 @@ defmodule RideDispatch.Dispatch.StateServer do
         status when status in [:driver_assigned, :driver_accepted] ->
           consistent_assignment?(ride, state)
 
-        status when status in [:matching, :cancelled, :completed] ->
+        :matching ->
           is_nil(Map.get(ride, :assignedDriverId)) and is_nil(Map.get(ride, :currentOfferId)) and
             not Enum.any?(active_offers(state), &(&1.rideId == ride.id))
+
+        status when status in [:cancelled, :completed] ->
+          current = Map.get(state.offers, Map.get(ride, :currentOfferId))
+
+          closed_pointer? =
+            if is_nil(current),
+              do: is_nil(Map.get(ride, :assignedDriverId)),
+              else: Map.get(current, :status) == status
+
+          closed_pointer? and not Enum.any?(active_offers(state), &(&1.rideId == ride.id))
 
         _ ->
           false
@@ -447,7 +488,10 @@ defmodule RideDispatch.Dispatch.StateServer do
 
   defp rejection_receipt?(_offer, _ride, _state), do: false
 
-  defp record_identity(%{id: id, status: _status}, id), do: :ok
+  defp record_identity(%{id: id, status: _status}, id) when is_binary(id) and id != "" do
+    if String.valid?(id), do: :ok, else: {:error, :inconsistent_ownership}
+  end
+
   defp record_identity(_record, _id), do: {:error, :inconsistent_ownership}
 
   defp resolve_acceptance_offer(ride, driver, state) do
