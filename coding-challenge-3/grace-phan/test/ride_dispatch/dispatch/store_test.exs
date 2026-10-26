@@ -281,6 +281,19 @@ defmodule RideDispatch.Dispatch.StoreTest do
     assert Store.get_driver(server, original.id) == {:ok, final}
   end
 
+  test "nonboolean availability is rejected without changing a driver" do
+    original = %{driver("D001") | status: :offline}
+    server = start_store([original])
+
+    for invalid <- [nil, "false", "true", 0, 1, :available, %{}] do
+      assert Store.set_driver_availability(server, original.id, invalid) ==
+               {:error, :invalid_availability}
+
+      assert Store.get_driver(server, original.id) == {:ok, original}
+      assert Store.set_driver_availability(server, "missing", invalid) == :not_found
+    end
+  end
+
   defp compete(functions) do
     parent = self()
     gate = make_ref()
