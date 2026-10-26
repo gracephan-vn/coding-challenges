@@ -11,6 +11,7 @@ defmodule RideDispatchWeb.Router do
     post "/rides", RideController, :create
     get "/rides/:rideId", RideController, :show
     post "/rides/:rideId/offers/:driverId/accept", RideController, :accept_offer
+    post "/rides/:rideId/offers/:driverId/reject", RideController, :reject_offer
 
     put "/drivers/:id/availability", DriverController, :availability
     put "/drivers/:id/location", DriverController, :location

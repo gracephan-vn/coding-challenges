@@ -33,10 +33,13 @@ defmodule RideDispatchWeb.RideController do
     end
   end
 
-  def accept_offer(conn, _params) do
+  def accept_offer(conn, _params), do: offer_command(conn, &Rides.accept_offer/3)
+  def reject_offer(conn, _params), do: offer_command(conn, &Rides.reject_offer/3)
+
+  defp offer_command(conn, command) do
     with true <- conn.body_params == %{},
          {:ok, "", conn} <- read_body(conn, length: 1, read_length: 1) do
-      case Rides.accept_offer(
+      case command.(
              server(conn),
              conn.path_params["rideId"],
              conn.path_params["driverId"]
