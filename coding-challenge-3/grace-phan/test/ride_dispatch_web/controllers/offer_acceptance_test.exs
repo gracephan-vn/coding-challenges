@@ -54,10 +54,26 @@ defmodule RideDispatchWeb.OfferAcceptanceTest do
     assert after_acceptance.pending_events == before.pending_events
     assert after_acceptance.idempotency == before.idempotency
     assert map_size(after_acceptance.offers) == 1
+
+    for available <- [false, true] do
+      assert connection(c.server)
+             |> put_req_header("content-type", "application/json")
+             |> put("/drivers/D001/availability", Jason.encode!(%{available: available}))
+             |> json_response(409) == error("Conflict")
+    end
+
+    assert :sys.get_state(c.server) == after_acceptance
   end
 
   test "empty object, discarded-response retry and late replay return the original 200", c do
-    original = json_request(c.server, c.ride.id, "D001", %{}) |> json_response(200)
+    task =
+      Task.async(fn ->
+        json_request(c.server, c.ride.id, "D001", %{})
+        :response_discarded
+      end)
+
+    assert Task.await(task) == :response_discarded
+    original = public_ride(c.ride, "DRIVER_ACCEPTED", "D001")
     before = :sys.get_state(c.server)
     :atomics.put(c.clock, 1, c.offer.expires_at_ms + 1)
     assert request(c.server, c.ride.id, "D001") |> json_response(200) == original
