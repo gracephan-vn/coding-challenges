@@ -365,6 +365,55 @@ defmodule RideDispatch.Dispatch.ReservationTest do
 
   defp business(state), do: Map.take(state, [:rides, :drivers, :offers, :idempotency])
 
+  test "synthetic malformed event identity/metadata fails at its authoritative key" do
+    {_ride, event, state} = fixture()
+
+    for broken <- [
+          Map.delete(event, :eventId),
+          %{event | eventId: "wrong"},
+          Map.put(event, :attempts, "wrong"),
+          Map.put(event, :next_attempt_at, "wrong")
+        ] do
+      input = put_in(state.pending_events[event.eventId], broken)
+
+      assert {:reply, {:error, {:permanent, :invalid_event}}, final} =
+               StateServer.handle_call({:process_event, event.eventId}, nil, input)
+
+      assert business(final) == business(input)
+
+      assert Map.keys(final.pending_events) |> Enum.sort() ==
+               Map.keys(input.pending_events) |> Enum.sort()
+
+      assert final.pending_events[event.eventId].status == :failed
+      assert final.pending_events[event.eventId].eventId == event.eventId
+    end
+  end
+
+  test "synthetic mismatched Driver map identity cannot create dangling ownership" do
+    {_ride, event, state} = fixture()
+    input = put_in(state.drivers["D001"].id, "wrong")
+
+    assert {:reply, {:error, {:permanent, :inconsistent_ownership}}, final} =
+             StateServer.handle_call({:process_event, event.eventId}, nil, input)
+
+    assert business(final) == business(input)
+  end
+
+  test "invalid final reservation clock leaves the event pending and all state unchanged" do
+    mode = :atomics.new(2, [])
+
+    clock = fn ->
+      if :atomics.get(mode, 1) == 0 or :atomics.add_get(mode, 2, 1) == 1, do: 0, else: nil
+    end
+
+    server = owner(drivers: [driver("D001", 0)], clock: clock)
+    {_ride, event} = matching(server, "final-clock")
+    before = :sys.get_state(server)
+    :atomics.put(mode, 1, 1)
+    assert Store.process_event(server, event.eventId) == {:error, :invalid_clock}
+    assert :sys.get_state(server) == before
+  end
+
   test "AC-09: two barrier-released Ride commands compete for one Driver" do
     for _ <- 1..20 do
       server = owner(drivers: [driver("D001", 0)])
