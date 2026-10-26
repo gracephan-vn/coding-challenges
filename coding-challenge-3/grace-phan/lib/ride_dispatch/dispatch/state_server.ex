@@ -42,6 +42,24 @@ defmodule RideDispatch.Dispatch.StateServer do
   end
 
   @impl true
+  def handle_call({:expire_offer, id}, _from, state) do
+    with :ok <- acceptance_identifiers(id, id),
+         {:ok, offer} <- Map.fetch(state.offers, id),
+         :ok <- record_identity(offer, id),
+         {:ok, ride} <- expiration_record(state.rides, Map.get(offer, :rideId)),
+         {:ok, driver} <- expiration_record(state.drivers, Map.get(offer, :driverId)),
+         :ok <- expiration_pending(ride, driver, offer, state),
+         :ok <- offer_deadline(offer),
+         {:ok, now} <- rejection_time(offer, state.clock) do
+      if Offer.expired?(offer, now),
+        do: expire_pending(ride, driver, offer, now, state),
+        else: {:reply, {:error, {:not_due, offer.expires_at_ms}}, state}
+    else
+      :error -> {:reply, :not_found, state}
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
   def handle_call({:reject_offer, ride_id, driver_id}, _from, state) do
     with :ok <- acceptance_identifiers(ride_id, driver_id),
          {:ok, ride} <- Map.fetch(state.rides, ride_id),
@@ -347,6 +365,83 @@ defmodule RideDispatch.Dispatch.StateServer do
       {:reply, {:ok, matching}, updated}
     else
       {:error, _reason} = error -> {:reply, error, state}
+    end
+  end
+
+  defp expiration_record(records, id) do
+    with {:ok, record} <- Map.fetch(records, id), :ok <- record_identity(record, id) do
+      {:ok, record}
+    else
+      _ -> {:error, :inconsistent_ownership}
+    end
+  end
+
+  defp expiration_pending(ride, driver, offer, state) do
+    if ride.status == :driver_assigned and driver.status == :offered and offer.status == :pending and
+         Map.get(ride, :currentOfferId) == offer.id and
+         Map.get(ride, :assignedDriverId) == driver.id and
+         not Enum.any?(
+           [:accepted_at_ms, :acceptance_result, :rejection_receipt, :expiration_receipt],
+           &Map.has_key?(offer, &1)
+         ) and
+         expiration_unique?(ride, driver, offer, state) and
+         exclusive_acceptance_history(ride, offer, state) == :ok and
+         not Map.has_key?(state.pending_events, "redispatch-expired-" <> offer.id),
+       do: :ok,
+       else: {:error, :inconsistent_ownership}
+  end
+
+  # Unrelated malformed records are diagnosed by scheduling discovery. Records
+  # referencing this Ride/Driver must still prove exclusive ownership.
+  defp expiration_unique?(ride, driver, offer, state) do
+    Enum.all?(state.offers, fn {key, other} ->
+      key == offer.id or
+        not (is_map(other) and
+               (Map.get(other, :rideId) == ride.id or Map.get(other, :driverId) == driver.id) and
+               Map.get(other, :status) not in [:rejected, :expired, :cancelled, :completed])
+    end) and
+      Enum.all?(state.rides, fn {key, other} ->
+        key == ride.id or
+          not (is_map(other) and
+                 (Map.get(other, :currentOfferId) == offer.id or
+                    (Map.get(other, :assignedDriverId) == driver.id and
+                       Map.get(other, :status) not in [
+                         :requested,
+                         :matching,
+                         :cancelled,
+                         :completed
+                       ])))
+      end)
+  end
+
+  defp expire_pending(ride, driver, offer, now, state) do
+    with {:ok, matching} <- RideStateMachine.transition(ride, :expire_offer),
+         {:ok, available} <- StateMachine.transition(driver, :expire_offer) do
+      matching = Map.merge(matching, %{assignedDriverId: nil, currentOfferId: nil})
+      id = "redispatch-expired-" <> offer.id
+
+      receipt = %{
+        offerId: offer.id,
+        rideId: ride.id,
+        driverId: driver.id,
+        expired_at_ms: now,
+        redispatch_event_id: id
+      }
+
+      expired = Map.merge(offer, %{status: :expired, expiration_receipt: receipt})
+      event = %{eventId: id, rideId: ride.id, type: :dispatch_requested, status: :pending}
+
+      updated = %{
+        state
+        | rides: Map.put(state.rides, ride.id, matching),
+          drivers: Map.put(state.drivers, driver.id, available),
+          offers: Map.put(state.offers, offer.id, expired),
+          pending_events: Map.put(state.pending_events, id, event)
+      }
+
+      {:reply, {:ok, :expired}, updated}
+    else
+      {:error, _} = error -> {:reply, error, state}
     end
   end
 

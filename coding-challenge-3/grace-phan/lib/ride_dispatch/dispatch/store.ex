@@ -33,6 +33,19 @@ defmodule RideDispatch.Dispatch.Store do
 
   # Commands
   @doc """
+  Expire one exact Offer using authoritative processing time. Returns
+  `{:ok, :expired | :already_expired | :ignored}`, `:not_found`, or
+  `{:error, {:not_due, deadline} | :invalid_request | :invalid_clock | :inconsistent_ownership}`.
+  The transition, immutable receipt and one redispatch event commit together.
+  A timeout does not cancel the command; all evidence is volatile.
+  """
+  def expire_offer(server, offer_id) do
+    result = GenServer.call(server, {:expire_offer, offer_id})
+    if result == {:ok, :expired}, do: GenServer.cast(server, :notify_events)
+    result
+  end
+
+  @doc """
   Atomically reject the exact current pending Offer, release its Driver and
   enqueue one Offer-derived redispatch event. Returns `{:ok, original_matching_ride}`,
   `:not_found`, or `{:error, reason}` using acceptance's identity/error conventions.
