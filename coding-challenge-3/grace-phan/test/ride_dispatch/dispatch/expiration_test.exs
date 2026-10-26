@@ -176,6 +176,46 @@ defmodule RideDispatch.Dispatch.ExpirationTest do
     end
   end
 
+  test "scheduling discovery returns authoritative time and only pending identity/deadline diagnostics" do
+    {server, ride, offer, clock} = reserved()
+    before = :sys.get_state(server)
+    assert {:ok, schedule} = Store.expiration_schedule(server)
+    assert schedule.now_ms == 0
+    assert [%{offer_id: id, expires_at_ms: 30_000, fingerprint: fingerprint}] = schedule.pending
+    assert id == offer.id and is_integer(fingerprint)
+    assert schedule.invalid_offers == []
+    assert :sys.get_state(server) == before
+    assert {:ok, _} = Store.accept_offer(server, ride.id, "A")
+    assert {:ok, %{pending: [], invalid_offers: []}} = Store.expiration_schedule(server)
+    :atomics.put(clock, 1, -999_999)
+    assert Store.expiration_schedule(server) == {:error, :invalid_clock}
+  end
+
+  test "synthetic malformed Offer discovery does not hide healthy Offers or block their expiration" do
+    {server, ride, offer, clock} = reserved()
+    :atomics.put(clock, 1, 30_000)
+    state = :sys.get_state(server)
+
+    for malformed <- [%{}, nil, %{offer | id: "wrong"}, %{offer | expires_at_ms: nil}] do
+      input = put_in(state.offers["broken"], malformed)
+
+      assert {:reply, {:ok, schedule}, ^input} =
+               StateServer.handle_call(:expiration_schedule, nil, input)
+
+      assert [%{offer_id: "broken", reason: reason, fingerprint: _}] = schedule.invalid_offers
+      assert reason in [:invalid_identity, :invalid_deadline]
+      assert Enum.any?(schedule.pending, &(&1.offer_id == offer.id))
+      # Identity-only corrupt records unrelated to this ownership cannot block it.
+      if malformed in [%{}, nil] do
+        assert {:reply, {:ok, :expired}, updated} =
+                 StateServer.handle_call({:expire_offer, offer.id}, nil, input)
+
+        assert updated.offers["broken"] == malformed
+        assert updated.rides[ride.id].status == :matching
+      end
+    end
+  end
+
   test "identifiers, exact ownership, malformed deadlines and conflicting evidence fail without mutation" do
     {server, ride, offer, clock} = reserved()
     :atomics.put(clock, 1, 30_000)

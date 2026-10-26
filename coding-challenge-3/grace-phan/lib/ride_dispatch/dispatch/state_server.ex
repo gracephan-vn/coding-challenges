@@ -42,6 +42,43 @@ defmodule RideDispatch.Dispatch.StateServer do
   end
 
   @impl true
+  def handle_call(:expiration_schedule, _from, state) do
+    result =
+      with {:ok, now} <- read_clock(state.clock) do
+        {pending, invalid} =
+          Enum.reduce(state.offers, {[], []}, fn {id, offer}, {pending, invalid} ->
+            fingerprint = :erlang.phash2(offer)
+
+            case scheduling_offer(offer, id) do
+              :ok ->
+                if offer.status == :pending,
+                  do:
+                    {[
+                       %{
+                         offer_id: id,
+                         expires_at_ms: offer.expires_at_ms,
+                         fingerprint: fingerprint
+                       }
+                       | pending
+                     ], invalid},
+                  else: {pending, invalid}
+
+              {:error, reason} ->
+                {pending, [%{offer_id: id, reason: reason, fingerprint: fingerprint} | invalid]}
+            end
+          end)
+
+        {:ok,
+         %{
+           now_ms: now,
+           pending: Enum.sort_by(pending, &{&1.expires_at_ms, &1.offer_id}),
+           invalid_offers: Enum.sort_by(invalid, & &1.offer_id)
+         }}
+      end
+
+    {:reply, result, state}
+  end
+
   def handle_call({:expire_offer, id}, _from, state) do
     with :ok <- acceptance_identifiers(id, id),
          {:ok, offer} <- Map.fetch(state.offers, id),
@@ -374,6 +411,26 @@ defmodule RideDispatch.Dispatch.StateServer do
       {:ok, record}
     else
       _ -> {:error, :inconsistent_ownership}
+    end
+  end
+
+  defp scheduling_offer(offer, id) do
+    if record_identity(offer, id) == :ok and
+         Map.get(offer, :status) in [
+           :pending,
+           :accepted,
+           :rejected,
+           :expired,
+           :cancelled,
+           :completed
+         ] and
+         Enum.all?([:rideId, :driverId], fn field ->
+           value = Map.get(offer, field)
+           is_binary(value) and value != "" and String.valid?(value)
+         end) do
+      if offer_deadline(offer) == :ok, do: :ok, else: {:error, :invalid_deadline}
+    else
+      {:error, :invalid_identity}
     end
   end
 

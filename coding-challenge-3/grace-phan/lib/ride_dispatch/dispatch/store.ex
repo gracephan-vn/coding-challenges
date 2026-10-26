@@ -8,6 +8,15 @@ defmodule RideDispatch.Dispatch.Store do
   """
 
   # Queries
+  @doc """
+  Read-only owner-clock snapshot: `{:ok, %{now_ms: integer, pending: deadlines,
+  invalid_offers: diagnostics}}` or `{:error, :invalid_clock}`. Pending entries
+  contain only offer_id, expires_at_ms and a diagnostic fingerprint. Invalid
+  entries contain storage identity, reason and fingerprint. Fingerprints are
+  nonauthoritative change hints; they never prove business identity or eligibility.
+  """
+  def expiration_schedule(server), do: GenServer.call(server, :expiration_schedule)
+
   @doc "All retained Offers, sorted by ID; deadlines alone never release ownership."
   def list_offers(server), do: GenServer.call(server, :list_offers)
   @doc "Returns `{:ok, offer}` or `:not_found`."
