@@ -51,6 +51,7 @@ defmodule RideDispatch.Dispatch.StateServer do
          {:ok, offer} <- current_acceptance_offer(ride, driver, state) do
       accept_pending(ride, driver, offer, state)
     else
+      {:replay, result} -> {:reply, {:ok, result}, state}
       :error -> {:reply, :not_found, state}
       :not_found -> {:reply, :not_found, state}
       {:error, _reason} = error -> {:reply, error, state}
@@ -309,7 +310,8 @@ defmodule RideDispatch.Dispatch.StateServer do
            do: {:error, :inconsistent_ownership},
            else: :not_found
 
-      {:ok, %{id: id, rideId: ride_id, driverId: driver_id, status: :pending} = offer} ->
+      {:ok, %{id: id, rideId: ride_id, driverId: driver_id, status: status} = offer}
+      when status in [:pending, :accepted] ->
         cond do
           id != Map.get(ride, :currentOfferId) or ride_id != ride.id or
               driver_id != Map.get(ride, :assignedDriverId) ->
@@ -320,6 +322,11 @@ defmodule RideDispatch.Dispatch.StateServer do
 
           not consistent_assignment?(ride, state) ->
             {:error, :inconsistent_ownership}
+
+          status == :accepted ->
+            if acceptance_receipt?(offer, ride),
+              do: {:replay, offer.acceptance_result},
+              else: {:error, :inconsistent_ownership}
 
           true ->
             {:ok, offer}
@@ -355,6 +362,22 @@ defmodule RideDispatch.Dispatch.StateServer do
        when is_integer(created) and is_integer(expires) and created < expires, do: :ok
 
   defp offer_deadline(_offer), do: {:error, :inconsistent_ownership}
+
+  defp acceptance_receipt?(%{accepted_at_ms: at, acceptance_result: result} = offer, ride)
+       when is_integer(at) and is_map(result) do
+    immutable_fields = [:id, :passengerId, :pickup, :destination]
+
+    offer_deadline(offer) == :ok and at >= offer.created_at_ms and at < offer.expires_at_ms and
+      Map.get(result, :id) == offer.rideId and Map.get(result, :status) == :driver_accepted and
+      Map.get(result, :currentOfferId) == offer.id and
+      Map.get(result, :assignedDriverId) == offer.driverId and
+      Enum.all?(
+        immutable_fields,
+        &(Map.has_key?(result, &1) and Map.fetch(result, &1) == Map.fetch(ride, &1))
+      )
+  end
+
+  defp acceptance_receipt?(_offer, _ride), do: false
 
   defp acceptance_time(offer, clock) do
     with {:ok, now} <- read_clock(clock) do
