@@ -98,4 +98,21 @@ defmodule RideDispatch.OfferFixtures do
 
     on_exit(fn -> :telemetry.detach(handler) end)
   end
+
+  defmodule CallbackOwner do
+    @moduledoc false
+    # Synthetic corruption fixtures only. Production StateServer has no seeded
+    # runtime snapshots or mutation protocol; live workflow tests never use this.
+    use GenServer
+    alias RideDispatch.Dispatch.StateServer
+    def start_link(snapshot), do: GenServer.start_link(__MODULE__, snapshot)
+    def init(snapshot), do: {:ok, snapshot}
+
+    def handle_call({:fixture_offer, id, record}, _, snapshot),
+      do: {:reply, :ok, put_in(snapshot.offers[id], record)}
+
+    def handle_call(message, from, snapshot), do: StateServer.handle_call(message, from, snapshot)
+    def handle_cast(message, snapshot), do: StateServer.handle_cast(message, snapshot)
+    def handle_info(message, snapshot), do: StateServer.handle_info(message, snapshot)
+  end
 end
