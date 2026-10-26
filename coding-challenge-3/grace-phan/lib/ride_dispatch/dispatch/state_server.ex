@@ -139,26 +139,34 @@ defmodule RideDispatch.Dispatch.StateServer do
   end
 
   def handle_call(:list_actionable_events, _from, state) do
-    now = state.clock.()
-
     events =
-      state.pending_events
-      |> Map.values()
-      |> Enum.filter(&(supported_pending?(&1) and eligible?(&1, now)))
-      |> Enum.sort_by(& &1.eventId)
+      case read_clock(state.clock) do
+        {:ok, now} ->
+          state.pending_events
+          |> Map.values()
+          |> Enum.filter(&(supported_pending?(&1) and eligible?(&1, now)))
+          |> Enum.sort_by(& &1.eventId)
+
+        {:error, :invalid_clock} ->
+          []
+      end
 
     {:reply, events, state}
   end
 
   def handle_call(:next_event_delay, _from, state) do
-    now = state.clock.()
-
     delay =
-      state.pending_events
-      |> Map.values()
-      |> Enum.filter(&supported_pending?/1)
-      |> Enum.map(&max(0, (Map.get(&1, :next_attempt_at) || now) - now))
-      |> Enum.min(fn -> nil end)
+      case read_clock(state.clock) do
+        {:ok, now} ->
+          state.pending_events
+          |> Map.values()
+          |> Enum.filter(&supported_pending?/1)
+          |> Enum.map(&max(0, (Map.get(&1, :next_attempt_at) || now) - now))
+          |> Enum.min(fn -> nil end)
+
+        {:error, :invalid_clock} ->
+          nil
+      end
 
     {:reply, delay, state}
   end
@@ -185,19 +193,24 @@ defmodule RideDispatch.Dispatch.StateServer do
 
       {:ok, event} ->
         cond do
-          event.status != :pending or event.type not in [:ride_created, :dispatch_requested] ->
+          not processable_pending?(event) ->
             {:reply, {:error, :unsupported_event}, state}
 
           not valid_event?(event, id) ->
             permanent_failure(state, event, :invalid_event)
 
-          not eligible?(event, state.clock.()) ->
-            {:reply, {:error, {:retry_at, event.next_attempt_at}}, state}
-
           true ->
-            case event.type do
-              :ride_created -> process_ride_created(event, state)
-              :dispatch_requested -> process_dispatch_requested(event, state)
+            with {:ok, now} <- read_clock(state.clock) do
+              if eligible?(event, now) do
+                case event.type do
+                  :ride_created -> process_ride_created(event, state)
+                  :dispatch_requested -> process_dispatch_requested(event, state)
+                end
+              else
+                {:reply, {:error, {:retry_at, event.next_attempt_at}}, state}
+              end
+            else
+              {:error, :invalid_clock} = error -> {:reply, error, state}
             end
         end
     end
@@ -209,37 +222,41 @@ defmodule RideDispatch.Dispatch.StateServer do
   end
 
   def handle_call({:fail_event, id, version, :processing_failed}, _from, state) do
-    case Map.fetch(state.pending_events, id) do
-      :error ->
-        {:reply, :not_found, state}
+    with {:ok, now} <- read_clock(state.clock) do
+      case Map.fetch(state.pending_events, id) do
+        :error ->
+          {:reply, :not_found, state}
 
-      {:ok, event} ->
-        cond do
-          not supported_pending?(event) ->
-            {:reply, {:error, :not_actionable}, state}
+        {:ok, event} ->
+          cond do
+            not processable_pending?(event) ->
+              {:reply, {:error, :not_actionable}, state}
 
-          Map.get(event, :attempts, 0) != version ->
-            {:reply, {:error, :stale_attempt}, state}
+            Map.get(event, :attempts, 0) != version ->
+              {:reply, {:error, :stale_attempt}, state}
 
-          not eligible?(event, state.clock.()) ->
-            {:reply, {:error, {:retry_at, event.next_attempt_at}}, state}
+            not eligible?(event, now) ->
+              {:reply, {:error, {:retry_at, event.next_attempt_at}}, state}
 
-          true ->
-            attempts = version + 1
-            failed = attempts >= 3
-            at = state.clock.() + 1000 * Integer.pow(2, attempts - 1)
+            true ->
+              attempts = version + 1
+              failed = attempts >= 3
+              at = now + 1000 * Integer.pow(2, attempts - 1)
 
-            updated =
-              Map.merge(event, %{
-                attempts: attempts,
-                status: if(failed, do: :failed, else: :pending),
-                next_attempt_at: if(failed, do: nil, else: at),
-                last_error: :processing_failed
-              })
+              updated =
+                Map.merge(event, %{
+                  attempts: attempts,
+                  status: if(failed, do: :failed, else: :pending),
+                  next_attempt_at: if(failed, do: nil, else: at),
+                  last_error: :processing_failed
+                })
 
-            result = if failed, do: {:error, :failed}, else: {:error, {:retry_at, at}}
-            {:reply, result, put_event(state, updated)}
-        end
+              result = if failed, do: {:error, :failed}, else: {:error, {:retry_at, at}}
+              {:reply, result, put_event(state, updated)}
+          end
+      end
+    else
+      {:error, :invalid_clock} = error -> {:reply, error, state}
     end
   end
 
@@ -435,6 +452,9 @@ defmodule RideDispatch.Dispatch.StateServer do
     do: %{state | pending_events: Map.put(state.pending_events, event.eventId, event)}
 
   defp supported_pending?(event), do: event.type == :ride_created and event.status == :pending
+
+  defp processable_pending?(event),
+    do: event.type in [:ride_created, :dispatch_requested] and event.status == :pending
 
   defp valid_event?(%{eventId: id, rideId: ride_id}, id),
     do: is_binary(ride_id) and ride_id != ""
