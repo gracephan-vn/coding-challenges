@@ -62,6 +62,25 @@ defmodule RideDispatchWeb.OfferRejectionTest do
            |> json_response(201) == public_ride(c.ride, "REQUESTED", nil)
   end
 
+  test "a completed HTTP response may be discarded and retried without another redispatch", c do
+    task =
+      Task.async(fn ->
+        request(c.server, c.ride.id, "A")
+        :response_discarded
+      end)
+
+    assert Task.await(task) == :response_discarded
+    before = :sys.get_state(c.server)
+
+    assert request(c.server, c.ride.id, "A") |> json_response(200) ==
+             public_ride(c.ride, "MATCHING", nil)
+
+    assert :sys.get_state(c.server) == before
+    assert before.offers[c.offer.id].rejection_receipt.original_result == before.rides[c.ride.id]
+    assert map_size(before.pending_events) == 3
+    assert before.pending_events["redispatch-" <> c.offer.id].status == :pending
+  end
+
   test "strict command bodies reject unsupported fields and parsed non-object JSON without mutation",
        c do
     before = :sys.get_state(c.server)
