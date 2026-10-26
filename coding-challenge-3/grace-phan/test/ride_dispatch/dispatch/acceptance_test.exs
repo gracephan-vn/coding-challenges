@@ -241,6 +241,79 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
     Enum.map(tasks, &Task.await/1)
   end
 
+  test "synthetic same-pair history is ambiguous before acceptance and after prior success" do
+    {server, ride, offer, _} = reserved()
+
+    for phase <- [:before, :after] do
+      if phase == :after, do: assert({:ok, _} = Store.accept_offer(server, ride.id, "D001"))
+      state = :sys.get_state(server)
+      older = %{offer | id: "older", status: :expired}
+      input = %{state | offers: Map.put(state.offers, older.id, older)}
+
+      assert {:reply, {:error, :ambiguous_offer}, ^input} =
+               StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+    end
+  end
+
+  test "synthetic history for another Driver does not make the current Offer ambiguous" do
+    {server, ride, offer, _} = reserved()
+    state = :sys.get_state(server)
+    older = %{offer | id: "older", driverId: "D002", status: :rejected}
+    input = %{state | offers: Map.put(state.offers, older.id, older)}
+
+    assert {:reply, {:ok, accepted}, final} =
+             StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+
+    assert accepted.currentOfferId == offer.id
+    assert final.offers[older.id] == older
+  end
+
+  test "synthetic rejected expired and superseded attempts never become current acceptance" do
+    {server, ride, offer, _} = reserved()
+    state = :sys.get_state(server)
+
+    for status <- [:rejected, :expired, :cancelled] do
+      next_status = if status == :cancelled, do: :cancelled, else: :matching
+
+      input =
+        state
+        |> put_in([:offers, offer.id, :status], status)
+        |> put_in([:rides, ride.id, :status], next_status)
+        |> put_in([:rides, ride.id, :currentOfferId], nil)
+        |> put_in([:rides, ride.id, :assignedDriverId], nil)
+        |> put_in([:drivers, "D001", :status], :available)
+
+      assert {:reply, {:error, :invalid_transition}, ^input} =
+               StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+    end
+
+    replacement = %{offer | id: "replacement", driverId: "D002"}
+
+    input =
+      state
+      |> put_in([:offers, offer.id, :status], :rejected)
+      |> put_in([:offers, replacement.id], replacement)
+      |> put_in([:rides, ride.id, :currentOfferId], replacement.id)
+      |> put_in([:rides, ride.id, :assignedDriverId], "D002")
+      |> put_in([:drivers, "D001", :status], :available)
+      |> put_in([:drivers, "D002", :status], :offered)
+
+    assert {:reply, {:error, :invalid_transition}, ^input} =
+             StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+  end
+
+  test "synthetic pending Offer with acceptance evidence is rejected instead of overwritten" do
+    {server, ride, offer, _} = reserved()
+    state = :sys.get_state(server)
+
+    for field <- [:accepted_at_ms, :acceptance_result] do
+      input = put_in(state.offers[offer.id], Map.put(offer, field, nil))
+
+      assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+               StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+    end
+  end
+
   defp reserved do
     clock = :atomics.new(1, [])
     server = owner(fn -> :atomics.get(clock, 1) end)
