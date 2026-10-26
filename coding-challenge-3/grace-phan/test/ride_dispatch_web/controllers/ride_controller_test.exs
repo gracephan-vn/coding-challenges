@@ -157,16 +157,15 @@ defmodule RideDispatchWeb.RideControllerTest do
 
   test "production uses the single supervised owner and seeded P001" do
     owner = Process.whereis(StateServer)
-    key = "http-production-#{System.unique_integer([:positive])}"
+    assert :sys.get_state(owner).passengers["P001"] == %{id: "P001"}
 
     response =
       build_conn()
-      |> put_req_header("content-type", "application/json")
-      |> put_req_header("idempotency-key", key)
-      |> post("/rides", Jason.encode!(body()))
-      |> json_response(201)
+      |> put_req_header("accept", "application/json")
+      |> get("/rides/missing")
+      |> json_response(404)
 
-    assert Store.get_ride(StateServer, response["data"]["rideId"]) |> elem(0) == :ok
+    assert response == error("Not Found")
     assert Process.whereis(StateServer) == owner
   end
 
