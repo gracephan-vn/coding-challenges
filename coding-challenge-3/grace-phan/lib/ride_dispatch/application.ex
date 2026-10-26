@@ -12,7 +12,10 @@ defmodule RideDispatch.Application do
       {DNSCluster, query: Application.get_env(:ride_dispatch, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: RideDispatch.PubSub},
       {RideDispatch.Dispatch.StateServer,
-       name: RideDispatch.Dispatch.StateServer, passengers: [%{id: "P001"}]},
+       name: RideDispatch.Dispatch.StateServer,
+       passengers: [%{id: "P001"}],
+       matching_radius_km: Application.get_env(:ride_dispatch, :matching_radius_km, 2.0),
+       offer_timeout_ms: Application.get_env(:ride_dispatch, :offer_timeout_ms, 30_000)},
       {RideDispatch.Dispatch.EventDispatcher,
        name: RideDispatch.Dispatch.EventDispatcher, store: RideDispatch.Dispatch.StateServer},
       # Start to serve requests, typically the last entry

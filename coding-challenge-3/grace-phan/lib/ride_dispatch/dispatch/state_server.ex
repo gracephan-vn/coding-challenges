@@ -13,16 +13,25 @@ defmodule RideDispatch.Dispatch.StateServer do
 
   @impl true
   def init(opts) do
-    with {:ok, drivers} <- seed_drivers(Keyword.get(opts, :drivers, [])),
+    clock = Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end)
+    radius = Keyword.get(opts, :matching_radius_km, 2.0)
+    timeout = Keyword.get(opts, :offer_timeout_ms, 30_000)
+
+    with :ok <- validate_policy(radius, timeout),
+         {:ok, _now} <- read_clock(clock),
+         {:ok, drivers} <- seed_drivers(Keyword.get(opts, :drivers, [])),
          {:ok, passengers} <- seed_passengers(Keyword.get(opts, :passengers, [])) do
       {:ok,
        %{
          drivers: drivers,
          passengers: passengers,
          rides: %{},
+         offers: %{},
          idempotency: %{},
          pending_events: %{},
-         clock: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end),
+         clock: clock,
+         matching_radius_km: radius,
+         offer_timeout_ms: timeout,
          event_subscribers: %{}
        }}
     else
@@ -31,6 +40,14 @@ defmodule RideDispatch.Dispatch.StateServer do
   end
 
   @impl true
+  def handle_call(:list_offers, _from, state) do
+    {:reply, state.offers |> Map.values() |> Enum.sort_by(& &1.id), state}
+  end
+
+  def handle_call({:get_offer, id}, _from, state) do
+    {:reply, Map.fetch(state.offers, id) |> event_result(), state}
+  end
+
   def handle_call({:get_driver, id}, _from, state) do
     result =
       case Map.fetch(state.drivers, id) do
@@ -365,4 +382,23 @@ defmodule RideDispatch.Dispatch.StateServer do
        do: Location.valid?(driver)
 
   defp valid_seed?(_driver), do: false
+
+  defp validate_policy(radius, _timeout) when not is_number(radius) or radius < 0,
+    do: {:error, :invalid_matching_radius}
+
+  defp validate_policy(_radius, timeout) when not is_integer(timeout) or timeout <= 0,
+    do: {:error, :invalid_offer_timeout}
+
+  defp validate_policy(_radius, _timeout), do: :ok
+
+  defp read_clock(clock) when is_function(clock, 0) do
+    case clock.() do
+      now when is_integer(now) -> {:ok, now}
+      _invalid -> {:error, :invalid_clock}
+    end
+  rescue
+    _error -> {:error, :invalid_clock}
+  end
+
+  defp read_clock(_clock), do: {:error, :invalid_clock}
 end

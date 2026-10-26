@@ -8,6 +8,11 @@ defmodule RideDispatch.Dispatch.Store do
   """
 
   # Queries
+  @doc "All retained Offers, sorted by ID; deadlines alone never release ownership."
+  def list_offers(server), do: GenServer.call(server, :list_offers)
+  @doc "Returns `{:ok, offer}` or `:not_found`."
+  def get_offer(server, id), do: GenServer.call(server, {:get_offer, id})
+
   @doc "All retained events, sorted by ID, including unsupported pending events."
   def list_events(server), do: GenServer.call(server, :list_events)
   @doc "Returns `{:ok, event}` or `:not_found`, including processed/failed records."
