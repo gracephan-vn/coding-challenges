@@ -75,4 +75,27 @@ defmodule RideDispatch.OfferFixtures do
       "destination" => %{"latitude" => 1, "longitude" => 1}
     }
   end
+
+  def listen(server) do
+    parent = self()
+    handler = make_ref()
+
+    events = [
+      [:ride_dispatch, :expiration, :result],
+      [:ride_dispatch, :expiration, :idle],
+      [:ride_dispatch, :event, :processed],
+      [:ride_dispatch, :dispatcher, :idle]
+    ]
+
+    :telemetry.attach_many(
+      handler,
+      events,
+      fn event, _, metadata, _ ->
+        if metadata.server == server, do: send(parent, {List.to_tuple(event), metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+  end
 end
