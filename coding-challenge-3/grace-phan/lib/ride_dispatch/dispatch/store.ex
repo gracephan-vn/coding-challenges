@@ -8,6 +8,9 @@ defmodule RideDispatch.Dispatch.Store do
   """
 
   # Queries
+  @doc "Returns the current Ride as `{:ok, ride}` or `:not_found`."
+  def get_ride(server, ride_id), do: GenServer.call(server, {:get_ride, ride_id})
+
   @doc "Returns `{:ok, driver}` or `:not_found`."
   def get_driver(server, driver_id), do: GenServer.call(server, {:get_driver, driver_id})
 
@@ -15,6 +18,18 @@ defmodule RideDispatch.Dispatch.Store do
   def list_available_drivers(server), do: GenServer.call(server, :list_available_drivers)
 
   # Commands
+  @doc """
+  Atomically creates a REQUESTED Ride, original result and pending RideCreated
+  event. Accepts a nonblank string key and a strict string-keyed request map.
+  Returns `{:ok, original_ride}` or `{:error, reason}` where reason is
+  `:invalid_idempotency_key`, `:invalid_request`, `:idempotency_conflict`, or
+  `:passenger_not_found`. Input validation precedes canonical replay/conflict;
+  passenger existence is checked only for new keys. Keys are owner-global.
+  A retry after a timeout is safe while this owner survives. Pending events are
+  not delivered here; nothing is durable across owner loss.
+  """
+  def create_ride(server, key, request), do: GenServer.call(server, {:create_ride, key, request})
+
   @doc """
   Enables (`true`) or disables (`false`) availability atomically through the
   Driver State Machine. Repeated requests succeed unchanged.

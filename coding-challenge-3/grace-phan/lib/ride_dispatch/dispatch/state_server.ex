@@ -2,6 +2,7 @@ defmodule RideDispatch.Dispatch.StateServer do
   @moduledoc false
   use GenServer
 
+  alias RideDispatch.Rides.Request
   alias RideDispatch.Location
   alias RideDispatch.Drivers.StateMachine
 
@@ -11,8 +12,17 @@ defmodule RideDispatch.Dispatch.StateServer do
 
   @impl true
   def init(opts) do
-    case seed_drivers(Keyword.get(opts, :drivers, [])) do
-      {:ok, drivers} -> {:ok, %{drivers: drivers}}
+    with {:ok, drivers} <- seed_drivers(Keyword.get(opts, :drivers, [])),
+         {:ok, passengers} <- seed_passengers(Keyword.get(opts, :passengers, [])) do
+      {:ok,
+       %{
+         drivers: drivers,
+         passengers: passengers,
+         rides: %{},
+         idempotency: %{},
+         pending_events: %{}
+       }}
+    else
       {:error, reason} -> {:stop, reason}
     end
   end
@@ -75,6 +85,73 @@ defmodule RideDispatch.Dispatch.StateServer do
         {:reply, {:error, :invalid_availability}, state}
     end
   end
+
+  def handle_call({:get_ride, id}, _from, state) do
+    {:reply, Map.get(state.rides, id, :not_found) |> ride_result(), state}
+  end
+
+  def handle_call({:create_ride, key, body}, _from, state) do
+    with true <- Request.valid_key?(key),
+         {:ok, canonical} <- Request.normalize(body) do
+      case Map.fetch(state.idempotency, key) do
+        {:ok, %{canonical_request: ^canonical, original_result: result}} ->
+          {:reply, result, state}
+
+        {:ok, _different} ->
+          {:reply, {:error, :idempotency_conflict}, state}
+
+        :error ->
+          create_ride(state, key, canonical)
+      end
+    else
+      false -> {:reply, {:error, :invalid_idempotency_key}, state}
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
+  defp ride_result(:not_found), do: :not_found
+  defp ride_result(ride), do: {:ok, ride}
+
+  defp create_ride(state, key, canonical) do
+    if Map.has_key?(state.passengers, canonical.passengerId) do
+      # VM-wide uniqueness, including owner restarts in the same VM. No durable
+      # identity guarantee across VM restarts; all authoritative state is volatile.
+      suffix = Integer.to_string(System.unique_integer([:positive, :monotonic]))
+      ride_id = "ride-" <> suffix
+      event_id = "event-" <> suffix
+      ride = Map.merge(canonical, %{id: ride_id, status: :requested, assignedDriverId: nil})
+      result = {:ok, ride}
+      record = %{canonical_request: canonical, original_result: result, event_id: event_id}
+      event = %{eventId: event_id, rideId: ride_id, type: :ride_created, status: :pending}
+
+      updated = %{
+        state
+        | rides: Map.put(state.rides, ride_id, ride),
+          idempotency: Map.put(state.idempotency, key, record),
+          pending_events: Map.put(state.pending_events, event_id, event)
+      }
+
+      {:reply, result, updated}
+    else
+      {:reply, {:error, :passenger_not_found}, state}
+    end
+  end
+
+  defp seed_passengers(seeds) when is_list(seeds) do
+    Enum.reduce_while(seeds, {:ok, %{}}, fn
+      %{id: id} = passenger, {:ok, passengers} when is_binary(id) and id != "" ->
+        if Map.has_key?(passengers, id) do
+          {:halt, {:error, {:duplicate_passenger_id, id}}}
+        else
+          {:cont, {:ok, Map.put(passengers, id, passenger)}}
+        end
+
+      _invalid, _acc ->
+        {:halt, {:error, :invalid_passenger_seed}}
+    end)
+  end
+
+  defp seed_passengers(_seeds), do: {:error, :invalid_passenger_seeds}
 
   defp seed_drivers(seeds) when is_list(seeds) do
     Enum.reduce_while(seeds, {:ok, %{}}, fn driver, {:ok, drivers} ->
