@@ -458,7 +458,7 @@ defmodule RideDispatch.Dispatch.StateServer do
     case offer.status do
       :expired ->
         if valid_history? and expiration_receipt?(offer, state) and
-             Map.get(ride, :currentOfferId) != offer.id,
+             expiration_unreferenced?(offer, state),
            do: {:done, :already_expired},
            else: {:error, :inconsistent_ownership}
 
@@ -470,7 +470,7 @@ defmodule RideDispatch.Dispatch.StateServer do
 
       :rejected ->
         if valid_history? and rejection_receipt?(offer, ride, state) and
-             Map.get(ride, :currentOfferId) != offer.id,
+             expiration_unreferenced?(offer, state),
            do: {:done, :ignored},
            else: {:error, :inconsistent_ownership}
 
@@ -500,6 +500,12 @@ defmodule RideDispatch.Dispatch.StateServer do
 
   defp expiration_receipt?(_offer, _state), do: false
 
+  defp expiration_unreferenced?(offer, state),
+    do:
+      not Enum.any?(state.rides, fn {_, ride} ->
+        is_map(ride) and Map.get(ride, :currentOfferId) == offer.id
+      end)
+
   defp expiration_ride_consistent?(%{status: status} = ride, state)
        when status in [:matching, :completed, :cancelled] do
     no_active? =
@@ -508,10 +514,12 @@ defmodule RideDispatch.Dispatch.StateServer do
           Map.get(offer, :status) not in [:rejected, :expired, :cancelled, :completed]
       end)
 
+    current = Map.get(state.offers, Map.get(ride, :currentOfferId))
+
     no_active? and current_offer_link(ride, state) == :ok and
       ((is_nil(Map.get(ride, :currentOfferId)) and is_nil(Map.get(ride, :assignedDriverId))) or
-         (status in [:completed, :cancelled] and
-            Map.get(state.offers[ride.currentOfferId], :status) == status))
+         (status in [:completed, :cancelled] and is_map(current) and
+            Map.get(current, :status) == status))
   end
 
   defp expiration_ride_consistent?(%{status: status} = ride, state)
@@ -519,11 +527,17 @@ defmodule RideDispatch.Dispatch.StateServer do
     with :ok <- current_offer_link(ride, state),
          {:ok, offer} <- expiration_record(state.offers, Map.get(ride, :currentOfferId)),
          {:ok, driver} <- expiration_record(state.drivers, Map.get(ride, :assignedDriverId)) do
-      {status, driver.status, offer.status} in [
-        {:driver_assigned, :offered, :pending},
-        {:driver_accepted, :busy, :accepted}
-      ] and
-        expiration_unique?(ride, driver, offer, state)
+      case {status, driver.status, offer.status} do
+        {:driver_assigned, :offered, :pending} ->
+          expiration_pending(ride, driver, offer, state) == :ok
+
+        {:driver_accepted, :busy, :accepted} ->
+          acceptance_receipt?(offer, ride) and expiration_unique?(ride, driver, offer, state) and
+            exclusive_acceptance_history(ride, offer, state) == :ok
+
+        _ ->
+          false
+      end
     else
       _ -> false
     end

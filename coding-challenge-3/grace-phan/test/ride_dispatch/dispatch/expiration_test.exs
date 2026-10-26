@@ -252,4 +252,68 @@ defmodule RideDispatch.Dispatch.ExpirationTest do
                StateServer.handle_call({:expire_offer, offer.id}, nil, input)
     end
   end
+
+  test "synthetic replay rejects dangling terminal identity and other Rides referencing the expired Offer" do
+    {server, ride, offer, clock} = reserved()
+    :atomics.put(clock, 1, 30_000)
+    assert Store.expire_offer(server, offer.id) == {:ok, :expired}
+    state = :sys.get_state(server)
+
+    for status <- [:completed, :cancelled] do
+      # Compatibility only: terminal business commands remain unimplemented.
+      input = put_in(state.rides[ride.id].status, status)
+
+      assert {:reply, {:ok, :already_expired}, ^input} =
+               StateServer.handle_call({:expire_offer, offer.id}, nil, input)
+
+      broken = put_in(input.rides[ride.id].assignedDriverId, "A")
+
+      assert {:reply, {:error, :inconsistent_ownership}, ^broken} =
+               StateServer.handle_call({:expire_offer, offer.id}, nil, broken)
+    end
+
+    other = %{
+      state.rides[ride.id]
+      | id: "other",
+        status: :driver_assigned,
+        assignedDriverId: "A",
+        currentOfferId: offer.id
+    }
+
+    input = put_in(state.rides["other"], other)
+
+    assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+             StateServer.handle_call({:expire_offer, offer.id}, nil, input)
+  end
+
+  test "synthetic replacement status without valid current evidence cannot authorize historical replay" do
+    {server, ride, offer, clock} = reserved()
+    :atomics.put(clock, 1, 30_000)
+    assert Store.expire_offer(server, offer.id) == {:ok, :expired}
+    Store.set_driver_availability(server, "B", true)
+    Store.process_event(server, "redispatch-expired-" <> offer.id)
+    {:ok, replacement} = Store.get_ride(server, ride.id)
+    state = :sys.get_state(server)
+
+    input =
+      put_in(
+        state.offers[replacement.currentOfferId],
+        Map.put(state.offers[replacement.currentOfferId], :expiration_receipt, %{})
+      )
+
+    assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+             StateServer.handle_call({:expire_offer, offer.id}, nil, input)
+
+    Store.accept_offer(server, ride.id, "B")
+    state = :sys.get_state(server)
+
+    input =
+      put_in(
+        state.offers[replacement.currentOfferId],
+        Map.delete(state.offers[replacement.currentOfferId], :acceptance_result)
+      )
+
+    assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+             StateServer.handle_call({:expire_offer, offer.id}, nil, input)
+  end
 end
