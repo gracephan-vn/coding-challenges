@@ -216,6 +216,50 @@ defmodule RideDispatch.Dispatch.TerminalLifecycleTest do
     end
   end
 
+  test "synthetic terminal replay rejects contradictory current ownership of a reused Driver" do
+    {server, ride, _, _} = reserved()
+    {:ok, _} = Store.accept_offer(server, ride.id, "A")
+    {:ok, _} = Store.complete_ride(server, ride.id)
+    {other, event} = matching(server, "other")
+    assert {:ok, :processed} = Store.process_event(server, event)
+    {:ok, accepted} = Store.accept_offer(server, other.id, "A")
+    state = :sys.get_state(server)
+    other_offer = state.offers[accepted.currentOfferId]
+    third = %{state.rides[other.id] | id: "third", currentOfferId: "third-offer"}
+    extra = %{other_offer | id: "third-offer", rideId: "third"}
+    broken = state |> put_in([:rides, "third"], third) |> put_in([:offers, "third-offer"], extra)
+
+    assert {:reply, {:error, :inconsistent_ownership}, ^broken} =
+             StateServer.handle_call({:terminal_ride, :complete, ride.id}, nil, broken)
+
+    assert Store.complete_ride(server, ride.id) ==
+             {:ok, state.rides[ride.id].terminal_receipt.original_result}
+
+    assert :sys.get_state(server) == state
+  end
+
+  test "synthetic cross-Ride references cannot authorize release or hide behind terminal closure" do
+    {server, ride, offer, _} = reserved()
+    state = :sys.get_state(server)
+    other = %{state.rides[ride.id] | id: "other", assignedDriverId: "B"}
+    broken = put_in(state.rides["other"], other)
+
+    assert {:reply, {:error, :inconsistent_ownership}, ^broken} =
+             StateServer.handle_call({:terminal_ride, :cancel, ride.id}, nil, broken)
+
+    {:ok, _} = Store.cancel_ride(server, ride.id)
+    {third, event} = matching(server, "third")
+    state = :sys.get_state(server)
+    broken = put_in(state.rides["other"], other)
+
+    assert {:reply, {:error, {:permanent, :inconsistent_ownership}}, final} =
+             StateServer.handle_call({:process_event, event}, nil, broken)
+
+    assert final.rides[third.id].status == :matching
+    assert final.drivers == broken.drivers and final.offers == broken.offers
+    assert broken.offers[offer.id].status == :cancelled
+  end
+
   defp terminal_command(:cancel), do: :cancel_ride
   defp terminal_command(:complete), do: :complete_ride
 end
