@@ -260,6 +260,23 @@ defmodule RideDispatch.Dispatch.TerminalLifecycleTest do
     assert broken.offers[offer.id].status == :cancelled
   end
 
+  test "synthetic malformed retained rejection history cannot authorize unassigned cancellation or replay" do
+    {server, ride, offer, _} = reserved()
+    {:ok, _} = Store.reject_offer(server, ride.id, "A")
+    before = :sys.get_state(server)
+    broken = update_in(before.offers[offer.id], &Map.delete(&1, :rejection_receipt))
+
+    assert {:reply, {:error, :inconsistent_ownership}, ^broken} =
+             StateServer.handle_call({:terminal_ride, :cancel, ride.id}, nil, broken)
+
+    {:ok, _} = Store.cancel_ride(server, ride.id)
+    state = :sys.get_state(server)
+    broken = update_in(state.offers[offer.id], &Map.delete(&1, :rejection_receipt))
+
+    assert {:reply, {:error, :inconsistent_ownership}, ^broken} =
+             StateServer.handle_call({:terminal_ride, :cancel, ride.id}, nil, broken)
+  end
+
   defp terminal_command(:cancel), do: :cancel_ride
   defp terminal_command(:complete), do: :complete_ride
 end
