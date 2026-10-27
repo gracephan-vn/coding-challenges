@@ -33,10 +33,19 @@ defmodule RideDispatchWeb.RideController do
     end
   end
 
+  def cancel(conn, _params), do: terminal_command(conn, &Rides.cancel_ride/2)
+  def complete(conn, _params), do: terminal_command(conn, &Rides.complete_ride/2)
+
+  defp terminal_command(conn, command) do
+    command(conn, fn server, ride_id, _driver_id -> command.(server, ride_id) end)
+  end
+
   def accept_offer(conn, _params), do: offer_command(conn, &Rides.accept_offer/3)
   def reject_offer(conn, _params), do: offer_command(conn, &Rides.reject_offer/3)
 
-  defp offer_command(conn, command) do
+  defp offer_command(conn, operation), do: command(conn, operation)
+
+  defp command(conn, command) do
     with true <- conn.body_params == %{},
          {:ok, "", conn} <- read_body(conn, length: 1, read_length: 1) do
       case command.(

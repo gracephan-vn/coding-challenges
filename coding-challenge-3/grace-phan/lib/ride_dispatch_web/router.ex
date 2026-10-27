@@ -10,6 +10,8 @@ defmodule RideDispatchWeb.Router do
 
     post "/rides", RideController, :create
     get "/rides/:rideId", RideController, :show
+    post "/rides/:rideId/cancel", RideController, :cancel
+    post "/rides/:rideId/complete", RideController, :complete
     post "/rides/:rideId/offers/:driverId/accept", RideController, :accept_offer
     post "/rides/:rideId/offers/:driverId/reject", RideController, :reject_offer
 

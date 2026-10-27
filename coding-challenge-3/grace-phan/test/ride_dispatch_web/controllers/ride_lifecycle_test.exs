@@ -178,7 +178,10 @@ defmodule RideDispatchWeb.RideLifecycleTest do
   defp request(server, id, operation), do: conn(server) |> post(command_path(id, operation))
 
   defp request(server, id, operation, payload),
-    do: conn(server) |> post(command_path(id, operation), payload)
+    do:
+      conn(server)
+      |> put_req_header("content-type", "application/json")
+      |> post(command_path(id, operation), Jason.encode!(payload))
 
   defp error(detail), do: %{"errors" => %{"detail" => detail}}
 
