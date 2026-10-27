@@ -1079,7 +1079,8 @@ defmodule RideDispatch.Dispatch.StateServer do
       offer.driverId != driver.id ->
         {:error, :wrong_driver}
 
-      Map.has_key?(offer, :expiration_receipt) or not consistent_assignment?(ride, state) ->
+      Map.has_key?(offer, :expiration_receipt) or Map.has_key?(offer, :rejection_receipt) or
+          not consistent_assignment?(ride, state) ->
         {:error, :inconsistent_ownership}
 
       true ->
