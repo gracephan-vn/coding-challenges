@@ -77,7 +77,7 @@ not crash-durable idempotency or a durable transactional outbox. One mailbox
 serializes reads/writes, records grow without eviction, and there are no external
 side-effect transactions or multi-node guarantees. Acceptance, rejection, release
 and rejection/expiration-triggered rematching are implemented below;
-cancellation/completion remain future features. See [AC traceability](docs/ac-traceability.md) for evidence boundaries.
+cancellation/completion are implemented in Feature #14 below. See [AC traceability](docs/ac-traceability.md) for evidence boundaries.
 
 
 ## Asynchronous event processing and reservation (Features #10A/#10B)
@@ -104,9 +104,10 @@ RideCreated PROCESSED + Ride MATCHING + one DispatchRequested PENDING
 It reuses `Rides.StateMachine.transition/2`. The successor ID is deterministically
 `dispatch-{rideId}`, distinct from the Ride and original event. Repeating a
 processed event changes nothing; a distinct duplicate for an already-MATCHING
-Ride is acknowledged as ignored without another successor. Known later or
-terminal Ride states are also ignored without changing the Ride. Missing Rides
-or invalid Ride states produce a permanent failed event, without a retry.
+Ride is acknowledged as ignored without another successor. Known later states
+are ignored; terminal states additionally require validated closure. Neither changes
+the Ride. Missing Rides, invalid states or corrupt terminal closure produce a
+permanent failed event, without a retry.
 
 DispatchRequested processing reuses the pure Matcher and both State Machines,
 selecting from current authoritative Driver coordinates/availability. It installs:
@@ -148,8 +149,8 @@ are not meaningful across VM restarts. Invalid runtime clock readings leave
 business state unchanged; discovery returns no actionable work until a later scan.
 
 A deadline passing does not close a pending Offer or release its Driver. Only an
-explicit rejection or expiration command may release it. A supervised scheduler
-triggers expiration as described below. Cancellation/completion remain absent;
+explicit rejection, expiration or cancellation command may release it. A supervised scheduler
+triggers expiration as described below. Cancellation and completion are documented in Feature #14;
 rematching follows rejection/expiration, with no continuous search loop.
 
 There are no claims, leases, or separate acknowledgements. Event records remain
@@ -239,10 +240,10 @@ the same pair. Conservatively, multiple Offers for that pair return
 it contradicts successful acceptance ownership. This is an approved API policy,
 not an additional challenge requirement. No generic idempotency framework is used.
 
-Future lifecycle commands must retain the receipt when closing an accepted Offer.
-Synthetic callback tests verify replay after COMPLETED/CANCELLED, including cleared
-current identity and a Driver subsequently BUSY on another Ride. These are
-compatibility fixtures, not implemented terminal lifecycle workflows. Stale
+Terminal commands retain the acceptance evidence while closing Offers as COMPLETED/CANCELLED.
+Feature #14 verifies historical replay through live terminal workflows and Driver
+reuse, as well as explicit callback corruption tests. Terminal Ride pointers are
+cleared; the terminal receipt retains exact historical identities. Stale
 requests without successful evidence conflict; replay never resurrects state.
 Retries after uncertain/lost responses are safe while the owner survives; receipts
 are lost with all other runtime state after owner crash. Tests discard completed
@@ -266,7 +267,7 @@ Ride uses a synthetic new-event fixture: no generic manual redispatch command ex
 AC-08's specified creation/acceptance/transition idempotency and AC-09's concurrent
 assignment requirements are VERIFIED with these tests and documented strategies.
 Features #12/#13 extend this evidence to rejection/expiration and rematching below.
-Cancellation and completion remain absent; AC-02/05/06 remain PARTIAL. See
+At the Feature #11 checkpoint cancellation/completion were absent; Feature #14 closes those gaps. See
 [AC traceability](docs/ac-traceability.md) for the evidence boundaries.
 
 ## Offer rejection and automatic rematching (Feature #12)
@@ -342,8 +343,8 @@ mix test test/ride_dispatch/dispatch/rejection_test.exs test/ride_dispatch/dispa
 
 AC-07 is VERIFIED for its rejection/rematching clauses; AC-08/09/10 regressions
 remain green. One mailbox, history scans/retention, volatile owner loss and
-single-node limits remain. Feature #13 adds expiration below; cancellation,
-completion and live terminal replay remain future work.
+single-node limits remain. Feature #13 adds expiration below; Feature #14 adds
+cancellation/completion and live terminal replay.
 
 ## Automatic Offer expiration (Feature #13)
 
@@ -417,7 +418,7 @@ handles rematching, retries and failures. No-candidate remains PROCESSED without
 another search loop. Expired Drivers remain excluded for that Ride and eligible
 elsewhere; replacement reservation uses latest state and its own processing time.
 
-Verified: **37 focused tests**, **267 full-suite tests**; warnings-as-errors,
+Historical Feature #13 verification: **37 focused tests**, **267 full-suite tests**; warnings-as-errors,
 format and diff checks passed. The delayed-scheduler test uses real supervised
 components: late HTTP Accept fails, a second Ride cannot take A, resume expires
 O001, the dispatcher assigns B, A later serves another Ride, and obsolete O001
@@ -440,4 +441,82 @@ mix test test/ride_dispatch/dispatch/expiration*_test.exs
 State, receipts, pending events and retry metadata remain volatile. Supervisor
 restart cannot restore records lost with StateServer; timestamps do not survive VM
 lifetimes meaningfully. Retained history/scans contend for one mailbox. AC-02/05/06
-remain PARTIAL pending cancellation/completion; AC-07/08/09/10 regressions pass.
+were PARTIAL at that checkpoint; Feature #14 below implements and verifies the
+remaining terminal behavior. AC-07/08/09/10 regressions continue to pass.
+
+
+## Ride cancellation and completion (Feature #14)
+
+```text
+POST /rides/:rideId/cancel
+POST /rides/:rideId/complete
+Store.cancel_ride(server, ride_id)
+Store.complete_ride(server, ride_id)
+```
+
+Both commands return `{:ok, original_terminal_ride}`, `:not_found`, or
+`{:error, :invalid_request | :invalid_transition | :inconsistent_ownership}`.
+HTTP accepts no body or JSON `{}`; unsupported fields, malformed JSON and nonempty
+unparsed bodies are rejected. No new key, Driver parameter or caller timestamp is
+required. The established `data`/`errors.detail` envelopes map success/proven replay
+to **200**, malformed requests to **400**, unknown Rides to **404**, lifecycle
+conflicts to **409**, and corrupted authoritative evidence to **500**. Trusted
+per-connection test injection remains private; these endpoints do not authenticate
+network callers.
+
+Cancellation permits REQUESTED, MATCHING, DRIVER_ASSIGNED and DRIVER_ACCEPTED.
+Unassigned cancellation changes no Driver or historical Offer. Pending cancellation
+closes the exact Offer as CANCELLED and releases its OFFERED Driver. Accepted
+cancellation closes the Offer as CANCELLED and releases its BUSY Driver. Completion
+requires DRIVER_ACCEPTED, closes the accepted Offer as COMPLETED and releases BUSY
+to AVAILABLE. Every command validates exact identities, source eligibility,
+exclusive ownership and retained evidence before installing all changes in one
+StateServer callback. No Offer, redispatch event or external side effect is created.
+Both terminal Ride pointers (`assignedDriverId`, `currentOfferId`) become nil.
+
+Each stored Ride retains immutable `terminal_receipt`: `operation` (`:cancel` or
+`:complete`), `rideId`, `source_status`, `offerId`, `driverId`, `original_result`.
+The original result is built before attaching the receipt, avoiding recursive
+snapshots. Terminal Offer status describes closure; unchanged `accepted_at_ms` and
+`acceptance_result` retain successful acceptance evidence. Rejected/expired history
+and original Ride-creation results remain unchanged.
+
+Replay validates cross-record relationships, original result, Offer storage key,
+source-state eligibility, acceptance evidence where required, retained closed
+history and absence of conflicting references. A terminal status or receipt shape
+alone is insufficient. The historical Driver may now be AVAILABLE, OFFLINE,
+OFFERED or BUSY, provided its current ownership is consistent. A proven duplicate
+returns the original result without another release; the opposite terminal
+operation conflicts. Creation replay still returns REQUESTED, proven acceptance
+replay returns its original DRIVER_ACCEPTED snapshot, and GET returns current
+CANCELLED/COMPLETED. Malformed relationships fail without partial mutation.
+
+Pending RideCreated/DispatchRequested events remain retained. On eligible delivery,
+valid terminal closure produces PROCESSED / `incompatible_ride_state`, counting
+one processing attempt without a retry failure or new Offer. Backoff eligibility
+and already-processed records retain their existing semantics. Corrupted closure
+fails permanently rather than masquerading as harmless stale work. Historical
+terminal Offers are excluded from scheduling only with valid proof; obsolete
+expiration commands return validated `:ignored` and never release reused Drivers.
+
+Verified: **42 focused tests** (16 Store/receipt/reuse, 10 concurrency, 5 worker
+integration, 11 HTTP), **310 full-suite tests**. Compile warnings-as-errors, format
+and diff checks passed. Live Store/HTTP tests complete R001, reuse A on accepted
+R002, then replay Complete/Accept and expire the old Offer without changing R002.
+Pending/accepted cancellation has equivalent reuse coverage. Real dispatcher
+barriers cover pending creation, dispatch and backoff events after cancellation;
+a real scheduler receives obsolete timer work after reuse. Ten ordered and
+barrier-released race groups assert final Ride/Driver/Offer/Event state. Deliberate
+corruption uses labeled callback fixtures; valid lifecycle workflows use real owners.
+
+```sh
+mix test test/ride_dispatch/dispatch/terminal*_test.exs test/ride_dispatch_web/controllers/ride_lifecycle_test.exs
+```
+
+AC-02/05/06 are now VERIFIED against their clauses in [AC traceability](docs/ac-traceability.md#feature-14-verification).
+All previously verified AC regressions pass. This completes the specified business
+lifecycle, not the independent submission audit. State/receipts/events remain
+volatile, histories grow without eviction, and scans share one single-node mailbox.
+A timeout does not cancel a command; receipt-proven retries require the same
+surviving authoritative state. No crash durability, hard scheduling SLA,
+authentication or external-side-effect transaction is claimed.
