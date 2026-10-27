@@ -41,6 +41,33 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
     assert :sys.get_state(server) == before
   end
 
+  test "synthetic pending Offer with rejection evidence cannot accept or mutate any state" do
+    {server, ride, offer, _clock} = reserved()
+    {_unrelated_ride, _event} = matching(server, "unrelated")
+    state = :sys.get_state(server)
+
+    # Obtain real rejection evidence, but attach it only to synthetic snapshots
+    # of the still-pending reservation. No public workflow produces this state.
+    assert {:reply, {:ok, _matching}, rejected} =
+             StateServer.handle_call({:reject_offer, ride.id, "D001"}, nil, state)
+
+    for evidence <- [rejected.offers[offer.id].rejection_receipt, %{invalid: true}, nil] do
+      input = put_in(state.offers[offer.id], Map.put(offer, :rejection_receipt, evidence))
+
+      assert input.rides[ride.id].status == :driver_assigned
+      assert input.drivers["D001"].status == :offered
+      assert input.offers[offer.id].status == :pending
+
+      assert {:reply, result, after_attempt} =
+               StateServer.handle_call({:accept_offer, ride.id, "D001"}, nil, input)
+
+      assert result == {:error, :inconsistent_ownership}
+      # Exact snapshot equality covers every Ride, Driver, Offer, Event,
+      # idempotency record and receipt, including unrelated records.
+      assert after_attempt === input
+    end
+  end
+
   test "synthetic ownership contradictions fail without installing any partial transition" do
     {server, ride, offer, _} = reserved()
     state = :sys.get_state(server)
