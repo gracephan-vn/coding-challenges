@@ -1,5 +1,9 @@
 import Config
 
+config :ride_dispatch,
+       :demo_drivers,
+       RideDispatch.Demo.drivers(config_env(), System.get_env("RIDE_DISPATCH_DEMO"))
+
 # config/runtime.exs is executed for all environments, including
 # during releases. It is executed after compilation and before the
 # system starts, so it is typically used to load production configuration

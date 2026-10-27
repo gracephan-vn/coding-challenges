@@ -14,6 +14,7 @@ defmodule RideDispatch.Application do
       {RideDispatch.Dispatch.StateServer,
        name: RideDispatch.Dispatch.StateServer,
        passengers: [%{id: "P001"}],
+       drivers: Application.get_env(:ride_dispatch, :demo_drivers, []),
        matching_radius_km: Application.get_env(:ride_dispatch, :matching_radius_km, 2.0),
        offer_timeout_ms: Application.get_env(:ride_dispatch, :offer_timeout_ms, 30_000)},
       {RideDispatch.Dispatch.EventDispatcher,
