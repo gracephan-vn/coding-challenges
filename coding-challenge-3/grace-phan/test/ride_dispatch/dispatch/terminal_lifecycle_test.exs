@@ -64,4 +64,45 @@ defmodule RideDispatch.Dispatch.TerminalLifecycleTest do
     assert after_cancel.drivers == before.drivers
     assert after_cancel.pending_events == before.pending_events
   end
+
+  for {operation, accepted?} <- [cancel: false, cancel: true, complete: true] do
+    test "#{operation} atomically closes accepted=#{accepted?} ownership and retains evidence" do
+      {server, ride, offer, _} = reserved()
+      if unquote(accepted?), do: assert({:ok, _} = Store.accept_offer(server, ride.id, "A"))
+      before = :sys.get_state(server)
+      operation = unquote(operation)
+      assert {:ok, result} = apply(Store, terminal_command(operation), [server, ride.id])
+      state = :sys.get_state(server)
+      status = Map.fetch!(%{cancel: :cancelled, complete: :completed}, operation)
+
+      assert result.status == status and result.assignedDriverId == nil and
+               result.currentOfferId == nil
+
+      assert state.drivers["A"] == %{before.drivers["A"] | status: :available}
+      assert state.offers[offer.id] == %{before.offers[offer.id] | status: status}
+
+      assert state.rides[ride.id].terminal_receipt == %{
+               operation: operation,
+               rideId: ride.id,
+               source_status: before.rides[ride.id].status,
+               offerId: offer.id,
+               driverId: "A",
+               original_result: result
+             }
+
+      assert state.pending_events == before.pending_events and
+               state.idempotency == before.idempotency
+
+      assert apply(Store, terminal_command(operation), [server, ride.id]) == {:ok, result}
+      opposite = Map.fetch!(%{cancel: :complete, complete: :cancel}, operation)
+
+      assert apply(Store, terminal_command(opposite), [server, ride.id]) ==
+               {:error, :invalid_transition}
+
+      assert :sys.get_state(server) == state
+    end
+  end
+
+  defp terminal_command(:cancel), do: :cancel_ride
+  defp terminal_command(:complete), do: :complete_ride
 end
