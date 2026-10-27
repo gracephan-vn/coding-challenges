@@ -79,7 +79,7 @@ defmodule RideDispatch.Dispatch.EventStoreTest do
              StateServer.handle_call({:get_event, "missing"}, nil, state)
   end
 
-  test "missing and invalid rides fail permanently; known later and terminal states are ignored" do
+  test "missing and invalid rides fail permanently; known later states are ignored" do
     {ride, id, state} = created()
 
     for {rides, reason} <- [
@@ -98,7 +98,7 @@ defmodule RideDispatch.Dispatch.EventStoreTest do
                StateServer.handle_call(:list_actionable_events, nil, updated)
     end
 
-    for status <- [:matching, :driver_assigned, :driver_accepted, :cancelled, :completed] do
+    for status <- [:matching, :driver_assigned, :driver_accepted] do
       fixture = %{state | rides: %{ride.id => %{ride | status: status}}}
 
       assert {:reply, {:ok, :ignored}, updated} =
@@ -106,6 +106,28 @@ defmodule RideDispatch.Dispatch.EventStoreTest do
 
       assert updated.rides == fixture.rides
       assert map_size(updated.pending_events) == 1
+    end
+  end
+
+  test "cancelled callback result is ignored without resurrection; a status alone fails" do
+    {ride, id, state} = created()
+
+    assert {:reply, {:ok, _}, input} =
+             StateServer.handle_call({:terminal_ride, :cancel, ride.id}, nil, state)
+
+    assert {:reply, {:ok, :ignored}, final} =
+             StateServer.handle_call({:process_event, id}, nil, input)
+
+    assert final.rides == input.rides and map_size(final.pending_events) == 1
+    assert final.pending_events[id].outcome == :incompatible_ride_state
+
+    for status <- [:cancelled, :completed] do
+      broken = put_in(state.rides[ride.id].status, status)
+
+      assert {:reply, {:error, {:permanent, :inconsistent_ownership}}, failed} =
+               StateServer.handle_call({:process_event, id}, nil, broken)
+
+      assert failed.rides == broken.rides
     end
   end
 

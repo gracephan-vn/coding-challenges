@@ -1134,6 +1134,12 @@ defmodule RideDispatch.Dispatch.StateServer do
     end
   end
 
+  defp ignore_terminal_event(event, ride, state) do
+    if record_identity(ride, event.rideId) == :ok and terminal_valid?(ride, state),
+      do: {:reply, {:ok, :ignored}, put_event(state, processed(event, :incompatible_ride_state))},
+      else: permanent_failure(state, event, :inconsistent_ownership)
+  end
+
   defp process_ride_created(event, state) do
     case Map.fetch(state.rides, event.rideId) do
       :error ->
@@ -1157,8 +1163,11 @@ defmodule RideDispatch.Dispatch.StateServer do
 
         {:reply, {:ok, :processed}, put_event(updated, processed(event, :matching_started))}
 
+      {:ok, %{status: status} = ride} when status in [:cancelled, :completed] ->
+        ignore_terminal_event(event, ride, state)
+
       {:ok, %{status: status}}
-      when status in [:matching, :driver_assigned, :driver_accepted, :cancelled, :completed] ->
+      when status in [:matching, :driver_assigned, :driver_accepted] ->
         {:reply, {:ok, :ignored}, put_event(state, processed(event, :incompatible_ride_state))}
 
       {:ok, _invalid} ->
@@ -1186,8 +1195,8 @@ defmodule RideDispatch.Dispatch.StateServer do
           permanent_failure(state, event, :inconsistent_ownership)
         end
 
-      {:ok, %{status: status}} when status in [:cancelled, :completed] ->
-        {:reply, {:ok, :ignored}, put_event(state, processed(event, :incompatible_ride_state))}
+      {:ok, %{status: status} = ride} when status in [:cancelled, :completed] ->
+        ignore_terminal_event(event, ride, state)
 
       {:ok, _invalid} ->
         permanent_failure(state, event, :invalid_state)

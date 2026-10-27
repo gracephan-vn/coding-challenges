@@ -198,17 +198,25 @@ defmodule RideDispatch.Dispatch.ReservationTest do
     end
   end
 
-  test "synthetic terminal Ride events are ignored without resurrection" do
+  test "terminal Ride dispatch requires closure proof and never resurrects" do
     {ride, event, state} = fixture()
 
+    assert {:reply, {:ok, _}, input} =
+             StateServer.handle_call({:terminal_ride, :cancel, ride.id}, nil, state)
+
+    assert {:reply, {:ok, :ignored}, final} =
+             StateServer.handle_call({:process_event, event.eventId}, nil, input)
+
+    assert business(final) == business(input)
+    assert final.pending_events[event.eventId].status == :processed
+
     for status <- [:cancelled, :completed] do
-      input = put_in(state.rides[ride.id].status, status)
+      broken = put_in(state.rides[ride.id].status, status)
 
-      assert {:reply, {:ok, :ignored}, final} =
-               StateServer.handle_call({:process_event, event.eventId}, nil, input)
+      assert {:reply, {:error, {:permanent, :inconsistent_ownership}}, failed} =
+               StateServer.handle_call({:process_event, event.eventId}, nil, broken)
 
-      assert business(final) == business(input)
-      assert final.pending_events[event.eventId].status == :processed
+      assert business(failed) == business(broken)
     end
   end
 
