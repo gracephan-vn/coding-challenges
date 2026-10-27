@@ -98,6 +98,42 @@ defmodule RideDispatch.Dispatch.StateServer do
     end
   end
 
+  def handle_call({:terminal_ride, operation, id}, _from, state) do
+    with :ok <- acceptance_identifiers(id, id),
+         {:ok, ride} <- Map.fetch(state.rides, id),
+         :ok <- record_identity(ride, id) do
+      cond do
+        ride.status in [:cancelled, :completed] ->
+          if terminal_valid?(ride, state) do
+            receipt = ride.terminal_receipt
+
+            result =
+              if receipt.operation == operation,
+                do: {:ok, receipt.original_result},
+                else: {:error, :invalid_transition}
+
+            {:reply, result, state}
+          else
+            {:reply, {:error, :inconsistent_ownership}, state}
+          end
+
+        operation == :cancel and ride.status in [:requested, :matching] ->
+          if is_nil(Map.get(ride, :assignedDriverId)) and is_nil(Map.get(ride, :currentOfferId)) and
+               not Enum.any?(active_offers(state), &(Map.get(&1, :rideId) == id)) do
+            install_terminal(ride, nil, nil, operation, state)
+          else
+            {:reply, {:error, :inconsistent_ownership}, state}
+          end
+
+        true ->
+          {:reply, {:error, :invalid_transition}, state}
+      end
+    else
+      :error -> {:reply, :not_found, state}
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
   def handle_call({:reject_offer, ride_id, driver_id}, _from, state) do
     with :ok <- acceptance_identifiers(ride_id, driver_id),
          {:ok, ride} <- Map.fetch(state.rides, ride_id),
@@ -370,6 +406,43 @@ defmodule RideDispatch.Dispatch.StateServer do
     if Enum.all?([ride_id, driver_id], &(is_binary(&1) and &1 != "" and String.valid?(&1))),
       do: :ok,
       else: {:error, :invalid_request}
+  end
+
+  defp terminal_valid?(ride, _state) do
+    case Map.get(ride, :terminal_receipt) do
+      %{
+        operation: :cancel,
+        rideId: id,
+        source_status: source,
+        offerId: nil,
+        driverId: nil,
+        original_result: result
+      } ->
+        id == ride.id and source in [:requested, :matching] and ride.status == :cancelled and
+          is_nil(Map.get(ride, :assignedDriverId)) and is_nil(Map.get(ride, :currentOfferId)) and
+          result == Map.delete(ride, :terminal_receipt)
+
+      _ ->
+        false
+    end
+  end
+
+  defp install_terminal(ride, _driver, _offer, operation, state) do
+    action = if operation == :cancel, do: :cancel_ride, else: :complete_ride
+    {:ok, terminal} = RideStateMachine.transition(ride, action)
+    result = Map.merge(terminal, %{assignedDriverId: nil, currentOfferId: nil})
+
+    receipt = %{
+      operation: operation,
+      rideId: ride.id,
+      source_status: ride.status,
+      offerId: nil,
+      driverId: nil,
+      original_result: result
+    }
+
+    stored = Map.put(result, :terminal_receipt, receipt)
+    {:reply, {:ok, result}, %{state | rides: Map.put(state.rides, ride.id, stored)}}
   end
 
   defp reject_pending(ride, driver, offer, state) do

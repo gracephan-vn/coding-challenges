@@ -40,6 +40,13 @@ defmodule RideDispatch.Dispatch.Store do
   @doc "Returns available drivers in lexicographic ID order."
   def list_available_drivers(server), do: GenServer.call(server, :list_available_drivers)
 
+  @doc "Cancel one Ride atomically; proven retries return the original terminal result."
+  def cancel_ride(server, ride_id), do: GenServer.call(server, {:terminal_ride, :cancel, ride_id})
+
+  @doc "Complete one accepted Ride atomically; proven retries never release a Driver again."
+  def complete_ride(server, ride_id),
+    do: GenServer.call(server, {:terminal_ride, :complete, ride_id})
+
   # Commands
   @doc """
   Expire one exact Offer using authoritative processing time. Returns
