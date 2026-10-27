@@ -1,7 +1,7 @@
 defmodule RideDispatch.Dispatch.TerminalLifecycleTest do
   use ExUnit.Case, async: true
   import RideDispatch.OfferFixtures
-  alias RideDispatch.Dispatch.Store
+  alias RideDispatch.Dispatch.{StateServer, Store}
 
   test "terminal commands validate identities and reject non-completable states unchanged" do
     {server, _} = owner()
@@ -100,6 +100,119 @@ defmodule RideDispatch.Dispatch.TerminalLifecycleTest do
                {:error, :invalid_transition}
 
       assert :sys.get_state(server) == state
+    end
+  end
+
+  test "synthetic terminal receipts must prove cross-record identity, evidence and exclusivity" do
+    {server, ride, offer, _} = reserved()
+    {:ok, _} = Store.accept_offer(server, ride.id, "A")
+    {:ok, _} = Store.complete_ride(server, ride.id)
+    state = :sys.get_state(server)
+    receipt = state.rides[ride.id].terminal_receipt
+
+    other = %{
+      state.rides[ride.id]
+      | id: "other",
+        status: :driver_assigned,
+        assignedDriverId: "A",
+        currentOfferId: offer.id
+    }
+
+    variants = [
+      put_in(state.rides[ride.id].terminal_receipt.offerId, "other"),
+      put_in(state.rides[ride.id].terminal_receipt.driverId, "B"),
+      put_in(state.rides[ride.id].terminal_receipt.source_status, :driver_assigned),
+      put_in(state.rides[ride.id].terminal_receipt.operation, :cancel),
+      put_in(state.rides[ride.id].terminal_receipt.original_result.id, "other"),
+      put_in(state.rides[ride.id].terminal_receipt.original_result.status, :cancelled),
+      put_in(state.offers[offer.id].rideId, "other"),
+      put_in(state.offers[offer.id].driverId, "B"),
+      put_in(state.offers[offer.id].id, "other"),
+      put_in(state.offers[offer.id].status, :cancelled),
+      put_in(state.offers[offer.id], Map.delete(state.offers[offer.id], :acceptance_result)),
+      put_in(state.offers[offer.id].acceptance_result.currentOfferId, "other"),
+      put_in(state.offers[offer.id], Map.put(state.offers[offer.id], :expiration_receipt, %{})),
+      put_in(state.rides["other"], other),
+      put_in(state.offers["other"], %{state.offers[offer.id] | id: "other", status: :pending})
+    ]
+
+    for input <- variants, operation <- [:cancel, :complete] do
+      assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+               StateServer.handle_call({:terminal_ride, operation, ride.id}, nil, input)
+    end
+
+    assert state.rides[ride.id].terminal_receipt == receipt
+  end
+
+  test "synthetic false terminal closure never exempts a Driver from active ownership checks" do
+    {server, ride, offer, _} = reserved()
+    {:ok, _} = Store.accept_offer(server, ride.id, "A")
+    {:ok, _} = Store.complete_ride(server, ride.id)
+    {other, event} = matching(server, "other")
+    state = :sys.get_state(server)
+    broken = update_in(state.rides[ride.id], &Map.delete(&1, :terminal_receipt))
+
+    assert {:reply, {:error, {:permanent, :inconsistent_ownership}}, final} =
+             StateServer.handle_call({:process_event, event}, nil, broken)
+
+    assert final.rides == broken.rides and final.drivers == broken.drivers and
+             final.offers == broken.offers
+
+    assert final.rides[other.id].status == :matching
+    assert final.offers[offer.id].status == :completed
+  end
+
+  for {operation, accepted?} <- [complete: true, cancel: false, cancel: true] do
+    test "live #{operation} accepted=#{accepted?} replay protects reused BUSY Driver and old timers" do
+      {server, ride, offer, _} = reserved()
+
+      accepted =
+        if unquote(accepted?) do
+          {:ok, accepted} = Store.accept_offer(server, ride.id, "A")
+          accepted
+        end
+
+      command = terminal_command(unquote(operation))
+      {:ok, result} = apply(Store, command, [server, ride.id])
+      {other, event} = matching(server, "reuse")
+      assert {:ok, :processed} = Store.process_event(server, event)
+      assert {:ok, other_accepted} = Store.accept_offer(server, other.id, "A")
+      before = :sys.get_state(server)
+      assert apply(Store, command, [server, ride.id]) == {:ok, result}
+
+      if accepted do
+        assert Store.accept_offer(server, ride.id, "A") == {:ok, accepted}
+      else
+        assert Store.accept_offer(server, ride.id, "A") == {:error, :invalid_transition}
+      end
+
+      assert Store.expire_offer(server, offer.id) == {:ok, :ignored}
+      assert Store.reject_offer(server, ride.id, "A") == {:error, :invalid_transition}
+      assert :sys.get_state(server) == before
+      assert before.drivers["A"].status == :busy
+      assert before.rides[other.id] == other_accepted
+      assert before.offers[other_accepted.currentOfferId].acceptance_result == other_accepted
+      assert map_size(before.offers) == 2 and map_size(before.pending_events) == 4
+      assert Store.create_ride(server, "original", body()) == {:ok, ride}
+    end
+  end
+
+  test "synthetic active contradictions and preexisting terminal evidence cannot be overwritten" do
+    {server, ride, offer, _} = reserved()
+    state = :sys.get_state(server)
+
+    variants = [
+      put_in(state.rides[ride.id].assignedDriverId, "B"),
+      put_in(state.rides[ride.id].currentOfferId, "missing"),
+      put_in(state.drivers["A"].status, :busy),
+      put_in(state.offers[offer.id].id, "wrong"),
+      put_in(state.offers[offer.id], Map.put(offer, :acceptance_result, %{})),
+      put_in(state.rides[ride.id], Map.put(state.rides[ride.id], :terminal_receipt, %{}))
+    ]
+
+    for input <- variants do
+      assert {:reply, {:error, :inconsistent_ownership}, ^input} =
+               StateServer.handle_call({:terminal_ride, :cancel, ride.id}, nil, input)
     end
   end
 
