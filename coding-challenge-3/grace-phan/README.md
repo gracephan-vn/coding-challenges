@@ -76,7 +76,7 @@ restart, keys, Rides and events are lost; a retry can create a new Ride. This is
 not crash-durable idempotency or a durable transactional outbox. One mailbox
 serializes reads/writes, records grow without eviction, and there are no external
 side-effect transactions or multi-node guarantees. Acceptance, rejection, release
-and rejection-triggered rematching are implemented below; expiration and
+and rejection/expiration-triggered rematching are implemented below;
 cancellation/completion remain future features. See [AC traceability](docs/ac-traceability.md) for evidence boundaries.
 
 
@@ -86,7 +86,8 @@ Asynchronous processing keeps matching outside the HTTP response lifecycle and
 lets pending work survive request completion or dispatcher restart while its owner
 remains alive. One supervised `Dispatch.EventDispatcher` starts after the named StateServer,
 independently of HTTP. Store operations accept an explicit PID/name for isolated
-tests. After a successful create or reject call, the Store wrapper requests a wake-up hint;
+tests. After successful create, reservation processing, rejection or expiration,
+Store requests a wake-up hint;
 creation's atomic callback does not publish events or spawn tasks. Startup and
 one-second recovery scans cover missed notifications, including a lost creation
 reply. Hints coalesce; only due supported events are selected, one per dispatcher
@@ -133,7 +134,7 @@ Offers retain `id`, `rideId`, `driverId`, `status: :pending`, `created_at_ms` an
 `expires_at_ms`. IDs use an independent `offer-` prefix and VM-wide unique counter.
 `Store.get_offer/2` and `Store.list_offers/1` are read-only queries; the latter sorts
 by ID. Retained rejected/expired Offer history supplies permanent Ride-scoped
-exclusions; rejection records these outcomes now, while expiration remains future work.
+exclusions; rejection and expiration both record these outcomes through atomic commands.
 
 Application configuration `:ride_dispatch, :matching_radius_km` defaults to 2.0
 (nonnegative number); `:offer_timeout_ms` defaults to 30_000 (positive integer).
@@ -147,9 +148,9 @@ are not meaningful across VM restarts. Invalid runtime clock readings leave
 business state unchanged; discovery returns no actionable work until a later scan.
 
 A deadline passing does not close a pending Offer or release its Driver. Only an
-explicit rejection or future expiration command may release it. There is no
-expiration scheduler, cancellation or completion; rematching occurs after rejection,
-with no continuous search loop.
+explicit rejection or expiration command may release it. A supervised scheduler
+triggers expiration as described below. Cancellation/completion remain absent;
+rematching follows rejection/expiration, with no continuous search loop.
 
 There are no claims, leases, or separate acknowledgements. Event records remain
 in the authoritative `pending_events` map after processing/failure. Attempt count
@@ -264,8 +265,8 @@ Ride uses a synthetic new-event fixture: no generic manual redispatch command ex
 
 AC-08's specified creation/acceptance/transition idempotency and AC-09's concurrent
 assignment requirements are VERIFIED with these tests and documented strategies.
-Feature #12 extends this evidence to rejection/rematching below. Expiration,
-cancellation and completion remain absent; AC-02/05/06 remain PARTIAL. See
+Features #12/#13 extend this evidence to rejection/expiration and rematching below.
+Cancellation and completion remain absent; AC-02/05/06 remain PARTIAL. See
 [AC traceability](docs/ac-traceability.md) for the evidence boundaries.
 
 ## Offer rejection and automatic rematching (Feature #12)
@@ -303,9 +304,9 @@ pair are conservatively ambiguous because the route has no Offer ID.
 
 Late rejection at/after the deadline is an approved policy while the Offer remains
 current PENDING with valid reservation ownership. Trusted processing time must be
-an integer no earlier than Offer creation; no automatic expiration or implicit
-release occurs from a passed deadline alone. Previously accepted Offers cannot be
-rejected. A closed unaccepted historical Offer is classified before new-acceptance
+an integer no earlier than Offer creation. The rejection command does not expire
+an Offer implicitly; a passed deadline alone never releases ownership. Previously
+accepted Offers cannot be rejected. A closed unaccepted historical Offer is classified before new-acceptance
 exclusivity checks: stale A acceptance after B accepts returns **409**, while
 malformed acceptance evidence still returns a controlled invariant failure.
 
@@ -324,7 +325,7 @@ Live HTTP/dispatcher observations can already see it PROCESSED; exact identity,
 history and business effects remain required. Original creation and rejection
 responses remain unchanged even when current Ride state progresses.
 
-Executed: **16 rejection Store**, **10 rematching/recovery**, **10 rejection HTTP**
+Historical Feature #12 verification: **16 rejection Store**, **10 rematching/recovery**, **10 rejection HTTP**
 tests; **64** focused acceptance/rejection/rematching/HTTP tests and **230** full
 suite tests passed. Compile warnings-as-errors, format and diff checks passed.
 Tests prove A → B, latest candidate changes, exhaustion and other-Ride eligibility,
@@ -341,5 +342,102 @@ mix test test/ride_dispatch/dispatch/rejection_test.exs test/ride_dispatch/dispa
 
 AC-07 is VERIFIED for its rejection/rematching clauses; AC-08/09/10 regressions
 remain green. One mailbox, history scans/retention, volatile owner loss and
-single-node limits remain. Expiration, cancellation and completion are future
-work; their races and live terminal replay must be tested when implemented.
+single-node limits remain. Feature #13 adds expiration below; cancellation,
+completion and live terminal replay remain future work.
+
+## Automatic Offer expiration (Feature #13)
+
+`Store.expire_offer(server, offer_id)` targets an exact Offer; no caller timestamp
+or HTTP expiration endpoint exists. Results are `{:ok, :expired}`,
+`{:ok, :already_expired}`, `{:ok, :ignored}`, `:not_found`,
+`{:error, {:not_due, deadline}}`, or `{:error, reason}` for controlled
+`:invalid_request`, `:invalid_clock` and `:inconsistent_ownership` errors.
+
+One callback validates storage identity, exact current ownership, active uniqueness,
+timestamp structure and absence of contradictory evidence. It reads trusted time
+after mailbox waiting. At `now_ms >= expires_at_ms`, both existing State Machines
+produce a single installation:
+
+```text
+Offer EXPIRED + Driver AVAILABLE + Ride MATCHING/unassigned
+one DispatchRequested PENDING: "redispatch-expired-" <> offer.id
+```
+
+The historical Offer retains immutable `expiration_receipt`: `offerId`, `rideId`,
+`driverId`, `expired_at_ms`, `redispatch_event_id`. First-time event-ID collisions
+fail without overwriting anything. Duplicate success requires the exact receipt,
+valid linked event (PENDING/PROCESSED/FAILED), no contradictory acceptance/rejection
+evidence and consistent current ownership. Status alone is insufficient. Proven
+replay does not read a fresh clock, release a reused Driver or clear a replacement.
+Consistently accepted/rejected Offers are ignored only after validating evidence;
+superseded PENDING records can instead be invariant corruption.
+
+The timeout remains configurable through `:ride_dispatch, :offer_timeout_ms`
+(default **30_000**, positive integer). Negative monotonic values are valid.
+Early expiration returns `not_due` unchanged; equality permits expiration and
+rejects first acceptance. An overdue reservation remains authoritative until a
+valid rejection or expiration commits. Late rejection can win that atomic race.
+
+One supervised `Dispatch.ExpirationScheduler` starts after StateServer and
+EventDispatcher, before Endpoint. The application retains **`:one_for_one`**;
+all three workers are permanent. Owner failure therefore replaces StateServer
+without restarting those siblings. Scheduler discovery and commands are pinned
+to the observed owner PID. Owner change clears timer generations, retries and
+diagnostic suppression before rediscovery; old IDs are never sent to a new owner.
+Scheduler restart reconstructs scheduling from surviving authoritative Offers.
+
+`Store.expiration_schedule/1` returns `{:ok, %{now_ms, pending, invalid_offers}}`
+or `{:error, :invalid_clock}`. Pending entries expose only `offer_id`,
+`expires_at_ms` and diagnostic `fingerprint`; invalid entries expose identity,
+reason and fingerprint. This immutable read does not claim or mutate work.
+Fingerprints are noncryptographic change hints, never business identity proofs.
+
+The scheduler uses one next-deadline timer plus wake-up hints and recovery scans.
+Application setting `:offer_expiration_scan_interval_ms` defaults to **1_000 ms**,
+validated within **1..60_000**. Successful reservation processing and expiration
+request hints from Store outside business callbacks. Missed hints, obsolete ticks
+and delayed timer delivery are safe; one command runs per scheduler turn. This
+provides no hard real-time scheduling SLA.
+
+Malformed Offers produce structured warnings with `offer_id` and `error_category`.
+Unrelated valid Offers continue expiring. Local diagnostics keep one entry per
+currently problematic Offer, log on fingerprint/category change, and permit bounded
+reminders/rechecks (`diagnostic_reminder_ms` child option, default **60_000**, positive
+integer). Scheduler restart/owner replacement clear suppression. Global invalid
+clock is reported separately and probed at bounded intervals; it never masquerades
+as an empty queue. Corruption still requires repair; suppression does not repair it.
+
+Definite transient scheduler failures back off **1s, then 2s**; after three failures
+they log exhaustion and wait the reminder interval before another bounded round.
+This local bookkeeping is volatile. Timeouts consume no definite-failure attempt:
+reread the same owner's Offer and validate closed evidence before retrying an
+unresolved outcome. No event failure accounting uses an Offer ID, and failed
+expiration creates no event. After commit, the existing EventDispatcher alone
+handles rematching, retries and failures. No-candidate remains PROCESSED without
+another search loop. Expired Drivers remain excluded for that Ride and eligible
+elsewhere; replacement reservation uses latest state and its own processing time.
+
+Verified: **37 focused tests**, **267 full-suite tests**; warnings-as-errors,
+format and diff checks passed. The delayed-scheduler test uses real supervised
+components: late HTTP Accept fails, a second Ride cannot take A, resume expires
+O001, the dispatcher assigns B, A later serves another Ride, and obsolete O001
+work changes nothing. Ordered/barrier-released Accept/Reject/Expire races assert
+all related records. Tests cover restart before/after commits, actual one-for-one
+owner replacement using application child specifications, missed hints, bounded
+logs, dynamic rematching and technical failure versus no-candidate.
+
+Corrupt-record tests use explicitly labeled synthetic callback owners/snapshots;
+global-clock recovery uses a real owner. Production exposes no state-mutation
+fixture API. Terminal replay remains callback
+compatibility evidence. One real queued Store timeout proves processing-time reads;
+scheduler timeout branches additionally use controlled signals around real Store
+outcomes. No arbitrary sleeps prove correctness.
+
+```sh
+mix test test/ride_dispatch/dispatch/expiration*_test.exs
+```
+
+State, receipts, pending events and retry metadata remain volatile. Supervisor
+restart cannot restore records lost with StateServer; timestamps do not survive VM
+lifetimes meaningfully. Retained history/scans contend for one mailbox. AC-02/05/06
+remain PARTIAL pending cancellation/completion; AC-07/08/09/10 regressions pass.
