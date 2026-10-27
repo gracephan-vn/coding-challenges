@@ -130,7 +130,8 @@ defmodule RideDispatch.Dispatch.StateServer do
 
         operation == :cancel and ride.status in [:requested, :matching] ->
           if is_nil(Map.get(ride, :assignedDriverId)) and is_nil(Map.get(ride, :currentOfferId)) and
-               not Enum.any?(active_offers(state), &(Map.get(&1, :rideId) == id)) do
+               not Enum.any?(active_offers(state), &(Map.get(&1, :rideId) == id)) and
+               retained_history_valid?(ride, nil, state) do
             install_terminal(ride, nil, nil, operation, state)
           else
             {:reply, {:error, :inconsistent_ownership}, state}
@@ -141,9 +142,11 @@ defmodule RideDispatch.Dispatch.StateServer do
           with {:ok, offer} <- expiration_record(state.offers, Map.get(ride, :currentOfferId)),
                {:ok, driver} <- expiration_record(state.drivers, Map.get(ride, :assignedDriverId)),
                true <- consistent_assignment?(ride, state),
+               true <- expiration_unique?(ride, driver, offer, state),
                :ok <- offer_deadline(offer),
                :ok <- exclusive_acceptance_history(ride, offer, state),
-               true <- terminal_source_evidence?(ride.status, offer, ride) do
+               true <- terminal_source_evidence?(ride.status, offer, ride),
+               true <- retained_history_valid?(ride, offer.id, state) do
             install_terminal(ride, driver, offer, operation, state)
           else
             _ -> {:reply, {:error, :inconsistent_ownership}, state}
@@ -463,15 +466,62 @@ defmodule RideDispatch.Dispatch.StateServer do
   end
 
   defp terminal_valid?(ride, state) do
-    terminal_shape?(ride, state) and
+    terminal_shape?(ride, state) and terminal_unreferenced?(ride, state) and
+      retained_history_valid?(ride, ride.terminal_receipt.offerId, state) and
       not Enum.any?(active_offers(state), &(Map.get(&1, :rideId) == ride.id)) and
-      Enum.all?(state.rides, fn {key, other} ->
-        id = ride.terminal_receipt.offerId
+      released_driver_consistent?(ride.terminal_receipt.driverId, state)
+  end
 
-        key == ride.id or is_nil(id) or
-          (is_map(other) and Map.get(other, :currentOfferId) != id and
-             not match?(%{terminal_receipt: %{offerId: ^id}}, other))
-      end)
+  defp retained_history_valid?(ride, current_id, state) do
+    Enum.all?(state.offers, fn {key, offer} ->
+      if is_map(offer) and Map.get(offer, :rideId) == ride.id and key != current_id do
+        record_identity(offer, key) == :ok and
+          case Map.get(offer, :status) do
+            :rejected -> rejection_receipt?(offer, ride, state)
+            :expired -> expiration_receipt?(offer, state)
+            _ -> false
+          end
+      else
+        true
+      end
+    end)
+  end
+
+  defp terminal_unreferenced?(ride, state) do
+    id = ride.terminal_receipt.offerId
+
+    Enum.all?(state.rides, fn {key, other} ->
+      key == ride.id or is_nil(id) or
+        (is_map(other) and Map.get(other, :currentOfferId) != id and
+           not match?(%{terminal_receipt: %{offerId: ^id}}, other))
+    end)
+  end
+
+  defp released_driver_consistent?(nil, _state), do: true
+
+  defp released_driver_consistent?(id, state) do
+    with {:ok, driver} <- expiration_record(state.drivers, id) do
+      rides = Enum.filter(active_rides(state), &(Map.get(&1, :assignedDriverId) == id))
+      offers = Enum.filter(active_offers(state), &(Map.get(&1, :driverId) == id))
+
+      case {driver.status, rides, offers} do
+        {status, [], []} when status in [:available, :offline] ->
+          true
+
+        {status, [ride], [offer]} when status in [:offered, :busy] ->
+          record_identity(ride, Map.get(ride, :id)) == :ok and
+            Map.get(state.rides, ride.id) == ride and
+            Map.get(state.offers, Map.get(offer, :id)) == offer and
+            consistent_assignment?(ride, state) and offer_deadline(offer) == :ok and
+            terminal_source_evidence?(ride.status, offer, ride) and
+            exclusive_acceptance_history(ride, offer, state) == :ok
+
+        _ ->
+          false
+      end
+    else
+      _ -> false
+    end
   end
 
   # Nonrecursive linkage proof for ownership scans. A terminal status alone never
@@ -480,7 +530,8 @@ defmodule RideDispatch.Dispatch.StateServer do
     with %{id: id, rideId: ride_id} <- offer,
          {:ok, ride} <- expiration_record(state.rides, ride_id) do
       Map.get(state.offers, id) == offer and terminal_shape?(ride, state) and
-        ride.terminal_receipt.offerId == id
+        terminal_unreferenced?(ride, state) and ride.terminal_receipt.offerId == id and
+        retained_history_valid?(ride, id, state)
     else
       _ -> false
     end
@@ -658,8 +709,7 @@ defmodule RideDispatch.Dispatch.StateServer do
     end
   end
 
-  # Terminal lifecycle commands are not implemented; retain their basic shape
-  # validation without claiming to verify a future cancellation/completion receipt.
+  # Closed terminal Offers require their Ride-bound receipt and exact history.
   defp scheduling_evidence?(terminal_offer, state),
     do:
       terminal_offer_closed?(terminal_offer, state) and
@@ -745,20 +795,9 @@ defmodule RideDispatch.Dispatch.StateServer do
   defp expiration_ride_consistent?(%{status: status} = ride, state)
        when status in [:completed, :cancelled], do: terminal_valid?(ride, state)
 
-  defp expiration_ride_consistent?(%{status: status} = ride, state)
-       when status == :matching do
-    no_active? =
-      not Enum.any?(state.offers, fn {_, offer} ->
-        is_map(offer) and Map.get(offer, :rideId) == ride.id and
-          Map.get(offer, :status) not in [:rejected, :expired, :cancelled, :completed]
-      end)
-
-    current = Map.get(state.offers, Map.get(ride, :currentOfferId))
-
-    no_active? and current_offer_link(ride, state) == :ok and
-      ((is_nil(Map.get(ride, :currentOfferId)) and is_nil(Map.get(ride, :assignedDriverId))) or
-         (status in [:completed, :cancelled] and is_map(current) and
-            Map.get(current, :status) == status))
+  defp expiration_ride_consistent?(%{status: :matching} = ride, state) do
+    is_nil(Map.get(ride, :currentOfferId)) and is_nil(Map.get(ride, :assignedDriverId)) and
+      not Enum.any?(active_offers(state), &(Map.get(&1, :rideId) == ride.id))
   end
 
   defp expiration_ride_consistent?(%{status: status} = ride, state)
