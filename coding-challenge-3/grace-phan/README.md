@@ -17,10 +17,153 @@ Ready to run in production? Please [check our deployment guides](https://phoenix
 * Forum: https://elixirforum.com/c/phoenix-forum
 * Source: https://github.com/phoenixframework/phoenix
 
+## Local opt-in demo and lifecycle logs (R2)
+
+After installing the project's dependencies (`mix setup`), start a fresh local
+server from this directory:
+
+```sh
+RIDE_DISPATCH_DEMO=true MIX_ENV=dev mix phx.server 2>&1 | tee /tmp/ride-dispatch-demo.log
+```
+
+The API listens on **127.0.0.1:4000** (override with `PORT`). The root URL is not a
+demo UI; use the API below. `RIDE_DISPATCH_DEMO` accepts unset/`false` (no demo
+Drivers), or exactly `true` in development only. Invalid values, or `true` in
+production/test, fail startup. This is local demonstration provisioning, not a
+production registration mechanism. Tests continue to use isolated owners.
+
+Passenger **P001** exists. Demo Drivers all start **AVAILABLE**, with no Offers:
+
+| Driver | Latitude | Longitude | Distance from pickup |
+|---|---:|---:|---|
+| D001 | 10.7769 | 106.7009 | 0 km; first choice |
+| D002 | 10.7819 | 106.7009 | Approximately 0.56 km; replacement |
+| D003 | 10.8169 | 106.7009 | Approximately 4.45 km; outside default 2 km radius |
+
+The ordinary StateServer seed validation and Matcher apply. Pickup is
+`10.7769, 106.7009`; destination below is `10.78, 106.71`. Offer response time is
+still **30 seconds**, so run the entire following block promptly in a second
+terminal. It uses Python 3's standard library as an HTTP client, prints actual
+responses, and polls GET with a five-second bound for asynchronous assignment:
+
+```sh
+python3 - <<'PY'
+import json, urllib.request, urllib.error, time
+base='http://127.0.0.1:4000'
+def req(method,path,body=None,headers=None):
+    data=None if body is None else json.dumps(body).encode()
+    request=urllib.request.Request(base+path,data=data,method=method,headers={'Content-Type':'application/json',**(headers or {})})
+    try:
+        with urllib.request.urlopen(request,timeout=5) as response: code,response_body=response.status,response.read()
+    except urllib.error.HTTPError as response: code,response_body=response.code,response.read()
+    result=json.loads(response_body)
+    print(method,path,code,json.dumps(result),flush=True)
+    return code,result
+body={'passengerId':'P001','pickup':{'latitude':10.7769,'longitude':106.7009},'destination':{'latitude':10.78,'longitude':106.71}}
+code,created=req('POST','/rides',body,{'Idempotency-Key':'r2-demo'})
+assert code==201
+ride=created['data']['rideId']
+def assigned(driver):
+    deadline=time.monotonic()+5
+    while time.monotonic()<deadline:
+        code,result=req('GET','/rides/'+ride)
+        if result['data']['status']=='DRIVER_ASSIGNED' and result['data']['assignedDriverId']==driver: return
+        time.sleep(0.05)
+    raise AssertionError('assignment not observed: '+driver)
+assigned('D001')
+assert req('POST',f'/rides/{ride}/offers/D001/reject')[0]==200
+assigned('D002')
+assert req('POST',f'/rides/{ride}/offers/D002/accept')[0]==200
+# Legitimate stale A request: must conflict, never be logged as successful acceptance.
+assert req('POST',f'/rides/{ride}/offers/D001/accept')[0]==409
+code,completed=req('POST',f'/rides/{ride}/complete')
+assert code==200 and completed['data']['status']=='COMPLETED'
+assert req('POST',f'/rides/{ride}/complete')==(code,completed)
+assert req('POST','/rides',body,{'Idempotency-Key':'r2-demo'})==(201,created)
+assert req('GET','/rides/'+ride)==(200,completed)
+# Existing availability command is idempotent for an AVAILABLE Driver and rejects BUSY.
+code,driver=req('PUT','/drivers/D002/availability',{'available':True})
+assert code==200 and driver['data']['status']=='AVAILABLE'
+print('EXTERNAL DEMO PASS',ride,flush=True)
+PY
+```
+
+Expected responses use the existing `{"data": {...}}` envelope: creation **201
+REQUESTED**, rejection **200 MATCHING**, acceptance **200 DRIVER_ACCEPTED**,
+completion **200 COMPLETED**. GET reflects current state, while completed retries
+return original results. The deliberately stale D001 acceptance returns **409**
+`{"errors":{"detail":"Conflict"}}`. The final PUT is the existing idempotent
+availability command: it succeeds unchanged when D002 is AVAILABLE and conflicts
+if still BUSY/OFFERED; it is not a new Driver-query endpoint.
+
+There is no HTTP Offer-query endpoint. GET Ride exposes `assignedDriverId` and
+status, enough for this route-based workflow. For read-only Offer/receipt/event
+inspection, start the same demo with `iex -S mix phx.server` instead of
+`mix phx.server`, then use the returned Ride ID:
+
+```elixir
+alias RideDispatch.Dispatch.{Store, StateServer}
+Store.get_ride(StateServer, "ride-1") # use the actual ID
+Store.get_driver(StateServer, "D002")
+Store.list_offers(StateServer)
+Store.list_events(StateServer)
+```
+
+Stop the server with Ctrl+C and restart the same command to repeat from initial
+seeds. All runtime Rides, Offers, receipts and events are volatile; no state is
+restored, and generated IDs are not promised to remain identical across restarts.
+
+**Correlation and commit boundary.** Store lifecycle commands preserve their
+public results and request a StateServer `handle_continue` observation. OTP has
+installed the new authoritative state before that continuation emits Logger
+records; business callbacks perform no log publication. The continuation reads
+only relevant identity/outcome fields from the completed command. No second
+business-state owner or event queue is introduced. HTTP response lines can appear
+before the corresponding lifecycle log; correlate identities rather than assuming
+that adjacent lines belong to one request.
+
+Semantic records include `ride.created`, `event.enqueued`,
+`ride.matching_started`, `dispatch.requested`, `dispatch.matching`,
+`offer.reserved`, `dispatch.processed`, `dispatch.no_candidate`,
+`offer.accepted/rejected/expired`, and `ride.cancelled/completed`.
+`dispatch.matching` records a completed selection, not a speculative candidate.
+Metadata includes `rideId`, `driverId`, `eventId`, `offerId`, `outcome` and attempts
+when available. `causedByEventId` links RideCreated processing to the newly enqueued
+dispatch; rejection/expiration logs identify the **new** redispatch event. Its
+processing carries the same eventId, even when a different Driver is selected.
+Both formatters include the metadata; workers pass identity explicitly.
+
+`operation.replayed` is not another transition. `operation.rejected` records
+business conflicts; `operation.failed` records invariant/clock failures.
+`event.retry_scheduled` / `event.processing_failed` and
+`expiration.retry_scheduled` distinguish technical failures from no-candidate.
+Store call timeouts log `operation.uncertain`; worker `*.timeout_reconciled`
+diagnostics report authoritative rechecks, including still-uncertain outcomes.
+Only actual due checks emit debug `scheduler.expiration_check`; recovery scans
+are quiet and malformed-record diagnostics retain bounded suppression.
+Lifecycle records contain no request bodies, idempotency keys or full state maps. Unsafe/oversized
+identifier strings are omitted from lifecycle metadata rather than interpolated.
+
+This is **best-effort in-process logging**, not a durable or exactly-once audit log.
+Owner/application crashes may lose state or a post-commit log; Logger backpressure
+can add mailbox latency. Logs neither determine business truth nor replace receipts.
+
+**Executed R2 evidence:** the external network workflow above passed, then passed
+again after a full server restart. One captured run linked `ride-1`, `event-1`,
+`dispatch-ride-1`, D001/`offer-2`, `redispatch-offer-2`, and D002/`offer-3`.
+Read-only Store inspection confirmed a completed Ride, D001/D002 AVAILABLE,
+rejected offer-2 with receipt, completed offer-3 with acceptance evidence, and
+three processed events. Duplicate completion/creation emitted replay records;
+stale acceptance emitted a rejection, with no extra success record.
+Separately, isolated tests cover worker retry, timeout reconciliation, no-candidate,
+expiration/cancellation logging, competing duplicates and corruption safety:
+**10 focused demo/logging tests and 321 full-suite tests passed** at R2.
+Technical fault injection is in-process test evidence, not a claimed network outage.
+
 ## Ride creation and retrieval (Feature #9)
 
 The application supervises one `Dispatch.StateServer`, seeded with Passenger
-`P001`. Drivers initially remain empty. Run `mix test` for regression tests;
+`P001`. Drivers initially remain empty unless the development demo above is explicitly enabled. Run `mix test` for regression tests;
 `mix test test/ride_dispatch/dispatch/ride_store_test.exs` includes barrier-released
 concurrent duplicate and conflicting creation commands without sleeps.
 

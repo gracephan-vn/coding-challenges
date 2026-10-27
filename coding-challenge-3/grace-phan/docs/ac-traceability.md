@@ -301,10 +301,38 @@ no caller authentication and lack of crash durability remain explicit limitation
   and [ADR-003](adr/ADR-003-event-processing.md) remain unchanged in #10B/#11/#12/#13. ADR-002's Phase B scope is historical. Single-mailbox
   contention, scans/sorting, volatile restart loss, single-owner/node limits,
   timeout uncertainty, and stale future ETS projections remain documented limits.
-- Additional evaluation deliverables are incomplete: `README.md` now documents Ride creation, replay and volatile-state limits; full workflow documentation remains incomplete; `architecture.md` and `sequence-diagram.md` are empty. Ride/event
-  correlated observability, the full scaling explanation, and runnable workflow
-  documentation remain future work. The guide's target diagram/roadmap and
-  Accepted ADRs do not complete these deliverables.
+- R2 resolves the local provisioning and lifecycle-observability submission gaps;
+  README includes an executable external HTTP demo. Architecture/sequence diagrams
+  and the full scaling explanation remain incomplete (F1/F6); broader README
+  presentation remains F7. Accepted ADRs do not complete those deliverables.
 - The guide's historical scalar Ride example is not the actual API or TDD history.
   The implemented pure Ride State Machine accepts a map. Future lifecycle
   signatures remain provisional; creation/query and event-processing APIs are implemented.
+
+## Submission remediation R2 — demo and correlated observability
+
+No business AC row is promoted or redefined. Previously recorded test counts
+remain historical. R2 verification: **321 full-suite tests**, **10 focused tests**
+(`demo_test.exs`: 2; `lifecycle_logging_test.exs`: 8), compilation with warnings as
+errors, format check and whitespace check passed.
+
+- **F3:** explicit development-only `RIDE_DISPATCH_DEMO=true` runtime configuration;
+  default production/test Driver seeds stay empty. P001 and deterministic AVAILABLE
+  D001/D002/D003 pass existing seed validation. Pure Matcher and isolated Store
+  tests prove ordering, radius exclusion and reset. An **external HTTP listener**
+  additionally completed create → D001 reject → D002 accept → complete, and repeated
+  successfully after full restart. Old Ride lookup returned 404 before the second run.
+- **F2:** post-installation StateServer continuation emits semantic logs with explicit
+  Ride/Driver/Offer/Event identity; creation is not processing, replay is not another
+  transition, and no-candidate is not technical failure. Captured external logs link
+  RideCreated to dispatch, reservation, rejection/redispatch, acceptance and completion.
+  Read-only Store queries confirmed final receipts, Driver release and three processed
+  events. Network duplicates replayed; stale acceptance returned 409 and logged a conflict.
+- **Evidence boundaries:** retry/fault/timeout cases use real isolated workers with
+  existing controlled injection; corruption protection is explicitly synthetic.
+  Semantic metadata assertions and authoritative final-state checks complement the
+  external demo; no fault injection was exposed through HTTP. Scheduler diagnostics
+  retain suppression. Logging tests run serialized and restore Logger configuration.
+- Logs are best effort, not durable/exactly-once; crash windows, single-owner/node
+  limits, volatile state, history growth and no caller authentication remain.
+  R2 changes no specification, Accepted ADR, state machine or dependency lockfile.
