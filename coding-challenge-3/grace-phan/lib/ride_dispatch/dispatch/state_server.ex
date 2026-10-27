@@ -125,6 +125,19 @@ defmodule RideDispatch.Dispatch.StateServer do
             {:reply, {:error, :inconsistent_ownership}, state}
           end
 
+        (operation == :cancel and ride.status in [:driver_assigned, :driver_accepted]) or
+            (operation == :complete and ride.status == :driver_accepted) ->
+          with {:ok, offer} <- expiration_record(state.offers, Map.get(ride, :currentOfferId)),
+               {:ok, driver} <- expiration_record(state.drivers, Map.get(ride, :assignedDriverId)),
+               true <- consistent_assignment?(ride, state),
+               :ok <- offer_deadline(offer),
+               :ok <- exclusive_acceptance_history(ride, offer, state),
+               true <- terminal_source_evidence?(ride.status, offer, ride) do
+            install_terminal(ride, driver, offer, operation, state)
+          else
+            _ -> {:reply, {:error, :inconsistent_ownership}, state}
+          end
+
         true ->
           {:reply, {:error, :invalid_transition}, state}
       end
@@ -408,26 +421,62 @@ defmodule RideDispatch.Dispatch.StateServer do
       else: {:error, :invalid_request}
   end
 
-  defp terminal_valid?(ride, _state) do
+  # Receipt predicates never depend on a historical Driver remaining AVAILABLE.
+  defp terminal_valid?(ride, state) do
     case Map.get(ride, :terminal_receipt) do
       %{
-        operation: :cancel,
+        operation: operation,
         rideId: id,
         source_status: source,
-        offerId: nil,
-        driverId: nil,
+        offerId: offer_id,
+        driverId: driver_id,
         original_result: result
       } ->
-        id == ride.id and source in [:requested, :matching] and ride.status == :cancelled and
-          is_nil(Map.get(ride, :assignedDriverId)) and is_nil(Map.get(ride, :currentOfferId)) and
-          result == Map.delete(ride, :terminal_receipt)
+        target = %{cancel: :cancelled, complete: :completed}[operation]
+
+        eligible =
+          (operation == :cancel and
+             source in [:requested, :matching, :driver_assigned, :driver_accepted]) or
+            (operation == :complete and source == :driver_accepted)
+
+        id == ride.id and eligible and ride.status == target and
+          Map.fetch(ride, :assignedDriverId) == {:ok, nil} and
+          Map.fetch(ride, :currentOfferId) == {:ok, nil} and
+          is_map(result) and result == Map.delete(ride, :terminal_receipt) and
+          terminal_history?(ride, source, offer_id, driver_id, state)
 
       _ ->
         false
     end
   end
 
-  defp install_terminal(ride, _driver, _offer, operation, state) do
+  defp terminal_history?(_ride, source, nil, nil, _state) when source in [:requested, :matching],
+    do: true
+
+  defp terminal_history?(ride, source, offer_id, driver_id, state)
+       when source in [:driver_assigned, :driver_accepted] do
+    with {:ok, offer} <- expiration_record(state.offers, offer_id),
+         {:ok, _driver} <- expiration_record(state.drivers, driver_id) do
+      offer.rideId == ride.id and offer.driverId == driver_id and offer.status == ride.status and
+        offer_deadline(offer) == :ok and terminal_source_evidence?(source, offer, ride)
+    else
+      _ -> false
+    end
+  end
+
+  defp terminal_history?(_, _, _, _, _), do: false
+
+  defp terminal_source_evidence?(:driver_accepted, offer, ride),
+    do: acceptance_receipt?(offer, ride)
+
+  defp terminal_source_evidence?(:driver_assigned, offer, _ride),
+    do:
+      not Enum.any?(
+        [:accepted_at_ms, :acceptance_result, :rejection_receipt, :expiration_receipt],
+        &Map.has_key?(offer, &1)
+      )
+
+  defp install_terminal(ride, driver, offer, operation, state) do
     action = if operation == :cancel, do: :cancel_ride, else: :complete_ride
     {:ok, terminal} = RideStateMachine.transition(ride, action)
     result = Map.merge(terminal, %{assignedDriverId: nil, currentOfferId: nil})
@@ -436,13 +485,35 @@ defmodule RideDispatch.Dispatch.StateServer do
       operation: operation,
       rideId: ride.id,
       source_status: ride.status,
-      offerId: nil,
-      driverId: nil,
+      offerId: if(offer, do: offer.id),
+      driverId: if(driver, do: driver.id),
       original_result: result
     }
 
     stored = Map.put(result, :terminal_receipt, receipt)
-    {:reply, {:ok, result}, %{state | rides: Map.put(state.rides, ride.id, stored)}}
+    updated = %{state | rides: Map.put(state.rides, ride.id, stored)}
+
+    updated =
+      if driver do
+        release =
+          cond do
+            operation == :complete -> :complete_ride
+            ride.status == :driver_accepted -> :cancel_accepted_ride
+            true -> :cancel_offer
+          end
+
+        {:ok, available} = StateMachine.transition(driver, release)
+
+        %{
+          updated
+          | drivers: Map.put(state.drivers, driver.id, available),
+            offers: Map.put(state.offers, offer.id, %{offer | status: result.status})
+        }
+      else
+        updated
+      end
+
+    {:reply, {:ok, result}, updated}
   end
 
   defp reject_pending(ride, driver, offer, state) do
