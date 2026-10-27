@@ -269,6 +269,9 @@ defmodule RideDispatchWeb.OfferAcceptanceTest do
     def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
     def init(opts), do: {:ok, opts}
 
+    # Response-mapping fixture follows Store's internal observation envelope.
+    def handle_call({:observed, command}, from, state), do: handle_call(command, from, state)
+
     def handle_call({:accept_offer, ride, driver}, _from, {reason, parent} = state) do
       send(parent, {:acceptance_called, ride, driver})
       {:reply, {:error, reason}, state}

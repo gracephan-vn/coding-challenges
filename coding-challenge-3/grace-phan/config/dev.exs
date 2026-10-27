@@ -42,8 +42,11 @@ config :ride_dispatch, RideDispatchWeb.Endpoint,
 # Enable dev routes for dashboard and mailbox
 config :ride_dispatch, dev_routes: true
 
-# Do not include metadata nor timestamps in development logs
-config :logger, :default_formatter, format: "[$level] $message\n"
+# Keep request parameter debug dumps out of the local demo log.
+config :logger, level: :info
+
+# Include explicit lifecycle correlation metadata in local demo logs
+config :logger, :default_formatter, format: "$time [$level] $message $metadata\n"
 
 # Set a higher stacktrace during development. Avoid configuring such
 # in production as building large stacktraces may be expensive.

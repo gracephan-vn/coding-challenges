@@ -24,7 +24,20 @@ config :ride_dispatch, RideDispatchWeb.Endpoint,
 # Configure Elixir's Logger
 config :logger, :default_formatter,
   format: "$time $metadata[$level] $message\n",
-  metadata: [:request_id]
+  metadata: [
+    :request_id,
+    :rideId,
+    :driverId,
+    :eventId,
+    :offerId,
+    :outcome,
+    :eventType,
+    :operation,
+    :attempts,
+    :retryAtMs,
+    :causedByEventId,
+    :driverStatus
+  ]
 
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason

@@ -273,6 +273,9 @@ defmodule RideDispatchWeb.OfferRejectionTest do
     use GenServer
     def start_link(reason), do: GenServer.start_link(__MODULE__, reason)
     def init(reason), do: {:ok, reason}
+    # Response-mapping fixture follows Store's internal observation envelope.
+    def handle_call({:observed, command}, from, state), do: handle_call(command, from, state)
+
     def handle_call({:reject_offer, _, _}, _, reason), do: {:reply, {:error, reason}, reason}
   end
 

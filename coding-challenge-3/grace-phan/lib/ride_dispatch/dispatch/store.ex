@@ -41,11 +41,11 @@ defmodule RideDispatch.Dispatch.Store do
   def list_available_drivers(server), do: GenServer.call(server, :list_available_drivers)
 
   @doc "Cancel one Ride atomically; proven retries return the original terminal result."
-  def cancel_ride(server, ride_id), do: GenServer.call(server, {:terminal_ride, :cancel, ride_id})
+  def cancel_ride(server, ride_id), do: command(server, {:terminal_ride, :cancel, ride_id})
 
   @doc "Complete one accepted Ride atomically; proven retries never release a Driver again."
   def complete_ride(server, ride_id),
-    do: GenServer.call(server, {:terminal_ride, :complete, ride_id})
+    do: command(server, {:terminal_ride, :complete, ride_id})
 
   # Commands
   @doc """
@@ -56,7 +56,7 @@ defmodule RideDispatch.Dispatch.Store do
   A timeout does not cancel the command; all evidence is volatile.
   """
   def expire_offer(server, offer_id) do
-    result = GenServer.call(server, {:expire_offer, offer_id})
+    result = command(server, {:expire_offer, offer_id})
     if result == {:ok, :expired}, do: GenServer.cast(server, :notify_events)
     result
   end
@@ -70,7 +70,7 @@ defmodule RideDispatch.Dispatch.Store do
   hints sent after the command; state and receipts are volatile, not durable.
   """
   def reject_offer(server, ride_id, driver_id) do
-    result = GenServer.call(server, {:reject_offer, ride_id, driver_id})
+    result = command(server, {:reject_offer, ride_id, driver_id})
     if match?({:ok, _}, result), do: GenServer.cast(server, :notify_events)
     result
   end
@@ -87,7 +87,7 @@ defmodule RideDispatch.Dispatch.Store do
   timeout does not cancel the command. This API does not authenticate the caller.
   """
   def accept_offer(server, ride_id, driver_id),
-    do: GenServer.call(server, {:accept_offer, ride_id, driver_id})
+    do: command(server, {:accept_offer, ride_id, driver_id})
 
   @doc "Subscribe a dispatcher or scheduler to nonauthoritative wake-up hints."
   def subscribe_events(server), do: GenServer.call(server, :subscribe_events)
@@ -102,14 +102,14 @@ defmodule RideDispatch.Dispatch.Store do
   Unsupported work is never consumed. Duplicate commands leave state unchanged.
   """
   def process_event(server, id) do
-    result = GenServer.call(server, {:process_event, id})
+    result = command(server, {:process_event, id})
     if result == {:ok, :processed}, do: GenServer.cast(server, :notify_events)
     result
   end
 
   @doc "Record a definite worker-side failure with an observed attempt version; never use for a timeout."
   def fail_event(server, id, version, :processing_failed),
-    do: GenServer.call(server, {:fail_event, id, version, :processing_failed})
+    do: command(server, {:fail_event, id, version, :processing_failed})
 
   @doc """
   Atomically creates a REQUESTED Ride, original result and pending RideCreated
@@ -122,7 +122,7 @@ defmodule RideDispatch.Dispatch.Store do
   not delivered here; nothing is durable across owner loss.
   """
   def create_ride(server, key, request) do
-    result = GenServer.call(server, {:create_ride, key, request})
+    result = command(server, {:create_ride, key, request})
     if match?({:ok, _}, result), do: GenServer.cast(server, :notify_events)
     result
   end
@@ -149,5 +149,13 @@ defmodule RideDispatch.Dispatch.Store do
   """
   def update_driver_location(server, driver_id, location) do
     GenServer.call(server, {:update_driver_location, driver_id, location})
+  end
+
+  defp command(server, message) do
+    GenServer.call(server, {:observed, message})
+  catch
+    :exit, {:timeout, _} = reason ->
+      RideDispatch.Dispatch.LifecycleLog.uncertain(message)
+      exit(reason)
   end
 end

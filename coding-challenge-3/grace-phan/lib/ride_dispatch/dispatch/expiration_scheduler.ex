@@ -6,7 +6,7 @@ defmodule RideDispatch.Dispatch.ExpirationScheduler do
   """
   use GenServer
   require Logger
-  alias RideDispatch.Dispatch.Store
+  alias RideDispatch.Dispatch.{Store, LifecycleLog}
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
   def wake(server), do: send(server, :events_available)
@@ -116,6 +116,12 @@ defmodule RideDispatch.Dispatch.ExpirationScheduler do
         idle(state, delay)
 
       candidate ->
+        LifecycleLog.emit(
+          "scheduler.expiration_check",
+          %{offerId: candidate.offer_id, outcome: :checking},
+          :debug
+        )
+
         result = invoke(state, candidate.offer_id)
 
         :telemetry.execute([:ride_dispatch, :expiration, :result], %{}, %{
@@ -211,15 +217,26 @@ defmodule RideDispatch.Dispatch.ExpirationScheduler do
     catch
       :exit, {:timeout, _call} ->
         # Timeout does not cancel a command. Reconcile against this same owner.
-        try do
-          case Store.get_offer(state.owner, id) do
-            {:ok, %{status: :pending}} -> {:error, :uncertain}
-            {:ok, _closed} -> Store.expire_offer(state.owner, id)
-            :not_found -> :not_found
+        result =
+          try do
+            case Store.get_offer(state.owner, id) do
+              {:ok, %{status: :pending}} -> {:error, :uncertain}
+              {:ok, _closed} -> Store.expire_offer(state.owner, id)
+              :not_found -> :not_found
+            end
+          catch
+            :exit, _ -> {:error, :uncertain}
           end
-        catch
-          :exit, _ -> {:error, :uncertain}
-        end
+
+        outcome = if is_tuple(result), do: elem(result, 1), else: result
+
+        LifecycleLog.emit(
+          "expiration.timeout_reconciled",
+          Map.put(offer_context(state, id), :outcome, outcome),
+          :warning
+        )
+
+        result
 
       :exit, _owner_unavailable ->
         {:error, :owner_unavailable}
@@ -253,6 +270,15 @@ defmodule RideDispatch.Dispatch.ExpirationScheduler do
         do: diagnose(state, candidate.offer_id, :retry_exhausted, candidate.fingerprint, now),
         else: state
 
+    LifecycleLog.emit(
+      "expiration.retry_scheduled",
+      Map.merge(
+        offer_context(state, candidate.offer_id),
+        %{attempts: attempts, retryAtMs: now + delay, outcome: :technical_failure}
+      ),
+      :warning
+    )
+
     entry = %{fingerprint: candidate.fingerprint, attempts: attempts, next_at: now + delay}
     %{state | retries: Map.put(state.retries, candidate.offer_id, entry)}
   end
@@ -262,9 +288,9 @@ defmodule RideDispatch.Dispatch.ExpirationScheduler do
 
     if is_nil(previous) or previous.reason != reason or previous.fingerprint != fingerprint or
          now >= previous.at + state.reminder do
-      Logger.warning("offer_expiration offer_id=#{inspect(id)} category=#{reason}",
-        offer_id: id,
-        error_category: reason
+      Logger.warning(
+        "offer_expiration offer_id=#{inspect(id)} category=#{reason}",
+        [offer_id: id, error_category: reason] ++ Map.to_list(offer_context(state, id))
       )
 
       entry = %{reason: reason, fingerprint: fingerprint, at: now}
@@ -272,6 +298,22 @@ defmodule RideDispatch.Dispatch.ExpirationScheduler do
     else
       state
     end
+  end
+
+  # Diagnostic-only read, pinned to the observed owner. Missing/malformed records
+  # cannot invent a Ride/Driver identity or interfere with scheduler recovery.
+  defp offer_context(_state, :global_clock), do: %{}
+
+  defp offer_context(state, id) do
+    case Store.get_offer(state.owner, id) do
+      {:ok, %{rideId: ride_id, driverId: driver_id}} ->
+        %{offerId: id, rideId: ride_id, driverId: driver_id}
+
+      _ ->
+        %{offerId: id}
+    end
+  catch
+    :exit, _ -> %{offerId: id}
   end
 
   defp idle(state, delay) do

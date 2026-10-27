@@ -42,6 +42,30 @@ defmodule RideDispatch.Dispatch.StateServer do
   end
 
   @impl true
+  def handle_continue({:observe, command, result, previous}, state) do
+    # OTP has installed state before invoking this continuation. Logging cannot
+    # roll back or repeat the business command, and uses no external publisher.
+    try do
+      RideDispatch.Dispatch.LifecycleLog.committed(command, result, previous, state)
+    rescue
+      _logging_failure ->
+        # Observability must never turn a completed command into owner/state loss.
+        RideDispatch.Dispatch.LifecycleLog.emit(
+          "observability.failed",
+          %{outcome: :log_projection_failed},
+          :error
+        )
+    end
+
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_call({:observed, command}, from, state) do
+    {:reply, result, updated} = handle_call(command, from, state)
+    {:reply, result, updated, {:continue, {:observe, command, result, state}}}
+  end
+
   def handle_call(:expiration_schedule, _from, state) do
     result =
       with {:ok, now} <- read_clock(state.clock) do

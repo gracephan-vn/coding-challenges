@@ -10,7 +10,7 @@ defmodule RideDispatch.Dispatch.EventDispatcher do
   No claim, lease, separate acknowledgement, or durable delivery is provided.
   """
   use GenServer
-  alias RideDispatch.Dispatch.Store
+  alias RideDispatch.Dispatch.{Store, LifecycleLog}
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
   def wake(dispatcher), do: send(dispatcher, :events_available)
@@ -135,17 +135,30 @@ defmodule RideDispatch.Dispatch.EventDispatcher do
     rescue
       _worker_exception -> record_failure(state, event)
     catch
-      :exit, {:timeout, _call} -> resolve_timeout(state, event.eventId)
+      :exit, {:timeout, _call} -> resolve_timeout(state, event)
       :exit, _owner_failure -> {:error, :owner_unavailable}
     end
   end
 
-  defp resolve_timeout(state, id) do
-    case Store.get_event(state.store, id) do
-      {:ok, %{status: :processed}} -> {:ok, :already_processed}
-      {:ok, %{status: :failed}} -> {:error, :failed}
-      _pending_or_missing -> {:error, :uncertain}
-    end
+  defp resolve_timeout(state, event) do
+    result =
+      case Store.get_event(state.store, event.eventId) do
+        {:ok, %{status: :processed}} -> {:ok, :already_processed}
+        {:ok, %{status: :failed}} -> {:error, :failed}
+        _pending_or_missing -> {:error, :uncertain}
+      end
+
+    LifecycleLog.emit(
+      "event.timeout_reconciled",
+      %{
+        eventId: event.eventId,
+        rideId: event.rideId,
+        outcome: elem(result, 1)
+      },
+      :warning
+    )
+
+    result
   end
 
   defp record_failure(state, event),

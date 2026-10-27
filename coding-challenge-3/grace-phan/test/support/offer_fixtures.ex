@@ -112,6 +112,7 @@ defmodule RideDispatch.OfferFixtures do
       do: {:reply, :ok, put_in(snapshot.offers[id], record)}
 
     def handle_call(message, from, snapshot), do: StateServer.handle_call(message, from, snapshot)
+    def handle_continue(message, snapshot), do: StateServer.handle_continue(message, snapshot)
     def handle_cast(message, snapshot), do: StateServer.handle_cast(message, snapshot)
     def handle_info(message, snapshot), do: StateServer.handle_info(message, snapshot)
   end
