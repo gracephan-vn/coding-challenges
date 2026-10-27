@@ -182,7 +182,7 @@ defmodule RideDispatch.Dispatch.RejectionTest do
     assert map_size(before.pending_events) == 3
   end
 
-  test "synthetic terminal compatibility retains replacement acceptance evidence and optionally its pointer" do
+  test "terminal callbacks retain replacement acceptance evidence for historical rejection replay" do
     {server, ride, offer, _} = reserved()
     assert {:ok, original} = Store.reject_offer(server, ride.id, "A")
     assert {:ok, _} = Store.set_driver_availability(server, "B", true)
@@ -190,21 +190,9 @@ defmodule RideDispatch.Dispatch.RejectionTest do
     assert {:ok, accepted} = Store.accept_offer(server, ride.id, "B")
     state = :sys.get_state(server)
 
-    for status <- [:completed, :cancelled], clear? <- [false, true] do
-      # Future lifecycle compatibility only: no production lifecycle mutation API.
-      input = put_in(state.rides[ride.id].status, status)
-      input = put_in(input.offers[accepted.currentOfferId].status, status)
-      input = put_in(input.drivers["B"].status, :available)
-
-      input =
-        if clear?,
-          do:
-            put_in(input.rides[ride.id], %{
-              input.rides[ride.id]
-              | assignedDriverId: nil,
-                currentOfferId: nil
-            }),
-          else: input
+    for {operation, status} <- [complete: :completed, cancel: :cancelled] do
+      assert {:reply, {:ok, %{status: ^status}}, input} =
+               StateServer.handle_call({:terminal_ride, operation, ride.id}, nil, state)
 
       assert {:reply, {:ok, ^original}, ^input} =
                StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
@@ -302,23 +290,28 @@ defmodule RideDispatch.Dispatch.RejectionTest do
     end
   end
 
-  test "synthetic terminal replay compatibility and ambiguous same-pair history" do
-    {server, ride, offer, _} = reserved()
-    assert {:ok, original} = Store.reject_offer(server, ride.id, "A")
-    state = :sys.get_state(server)
-
+  test "live terminal replay preserves rejection evidence; ambiguous same-pair history still fails" do
     for status <- [:cancelled, :completed] do
-      # Future lifecycle compatibility only, not live cancellation/completion coverage.
-      input = put_in(state.rides[ride.id].status, status)
+      {server, ride, offer, _} = reserved()
+      assert {:ok, original} = Store.reject_offer(server, ride.id, "A")
 
-      assert {:reply, {:ok, ^original}, ^input} =
+      if status == :completed do
+        assert {:ok, _} = Store.set_driver_availability(server, "B", true)
+        assert {:ok, :processed} = Store.process_event(server, "redispatch-" <> offer.id)
+        assert {:ok, _} = Store.accept_offer(server, ride.id, "B")
+        assert {:ok, _} = Store.complete_ride(server, ride.id)
+      else
+        assert {:ok, _} = Store.cancel_ride(server, ride.id)
+      end
+
+      before = :sys.get_state(server)
+      assert Store.reject_offer(server, ride.id, "A") == {:ok, original}
+      assert :sys.get_state(server) == before
+      input = put_in(before.offers["another"], %{before.offers[offer.id] | id: "another"})
+
+      assert {:reply, {:error, :ambiguous_offer}, ^input} =
                StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
     end
-
-    input = put_in(state.offers["another"], %{state.offers[offer.id] | id: "another"})
-
-    assert {:reply, {:error, :ambiguous_offer}, ^input} =
-             StateServer.handle_call({:reject_offer, ride.id, "A"}, nil, input)
   end
 
   test "stale Accept after replacement acceptance is a conflict, not invariant corruption" do

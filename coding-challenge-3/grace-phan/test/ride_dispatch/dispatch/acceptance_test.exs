@@ -324,14 +324,13 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
     {server, ride, offer, clock}
   end
 
-  test "synthetic terminal lifecycle preserves replay with cleared or retained current identity" do
+  test "terminal callback results preserve replay with proven closure and cleared identity" do
     {server, ride, offer, _} = reserved()
     assert {:ok, accepted} = Store.accept_offer(server, ride.id, "D001")
     state = :sys.get_state(server)
 
-    for {ride_status, offer_status} <- [completed: :completed, cancelled: :cancelled],
-        clear? <- [true, false] do
-      input = terminal_fixture(state, ride.id, offer.id, ride_status, offer_status, clear?)
+    for status <- [:completed, :cancelled] do
+      input = terminal_fixture(state, ride.id, status)
       input = %{input | clock: fn -> raise "replay must not check current time" end}
 
       assert {:reply, {:ok, ^accepted}, ^input} =
@@ -344,14 +343,14 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
     end
   end
 
-  test "synthetic terminal replay does not interfere with Driver accepted ownership on another Ride" do
-    {server, ride, offer, _} = reserved()
+  test "terminal callback replay does not interfere with Driver accepted ownership on another Ride" do
+    {server, ride, _offer, _} = reserved()
     assert {:ok, accepted} = Store.accept_offer(server, ride.id, "D001")
 
     input =
-      terminal_fixture(:sys.get_state(server), ride.id, offer.id, :completed, :completed, true)
+      terminal_fixture(:sys.get_state(server), ride.id, :completed)
 
-    # Only terminal state is synthetic; all subsequent operations use the real callbacks.
+    # Callback-level compatibility; live reuse is covered in TerminalLifecycleTest.
     assert {:reply, {:ok, other}, input} =
              StateServer.handle_call({:create_ride, "other", body()}, nil, input)
 
@@ -378,20 +377,13 @@ defmodule RideDispatch.Dispatch.AcceptanceTest do
     assert input.rides[other.id] == other_accepted
   end
 
-  defp terminal_fixture(state, ride_id, offer_id, ride_status, offer_status, clear?) do
-    state =
-      state
-      |> put_in([:rides, ride_id, :status], ride_status)
-      |> put_in([:offers, offer_id, :status], offer_status)
-      |> put_in([:drivers, "D001", :status], :available)
+  defp terminal_fixture(state, ride_id, status) do
+    operation = Map.fetch!(%{completed: :complete, cancelled: :cancel}, status)
 
-    if clear? do
-      state
-      |> put_in([:rides, ride_id, :assignedDriverId], nil)
-      |> put_in([:rides, ride_id, :currentOfferId], nil)
-    else
-      state
-    end
+    assert {:reply, {:ok, _result}, terminal} =
+             StateServer.handle_call({:terminal_ride, operation, ride_id}, nil, state)
+
+    terminal
   end
 
   test "AC-09 live competing Rides retain exclusive ownership after acceptance" do

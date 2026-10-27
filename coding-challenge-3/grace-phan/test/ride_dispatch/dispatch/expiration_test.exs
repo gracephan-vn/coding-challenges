@@ -253,37 +253,42 @@ defmodule RideDispatch.Dispatch.ExpirationTest do
     end
   end
 
-  test "synthetic replay rejects dangling terminal identity and other Rides referencing the expired Offer" do
-    {server, ride, offer, clock} = reserved()
-    :atomics.put(clock, 1, 30_000)
-    assert Store.expire_offer(server, offer.id) == {:ok, :expired}
-    state = :sys.get_state(server)
-
+  test "live terminal expiration replay rejects synthetic dangling and cross-Ride references" do
     for status <- [:completed, :cancelled] do
-      # Compatibility only: terminal business commands remain unimplemented.
-      input = put_in(state.rides[ride.id].status, status)
+      {server, ride, offer, clock} = reserved()
+      :atomics.put(clock, 1, 30_000)
+      assert Store.expire_offer(server, offer.id) == {:ok, :expired}
 
-      assert {:reply, {:ok, :already_expired}, ^input} =
-               StateServer.handle_call({:expire_offer, offer.id}, nil, input)
+      if status == :completed do
+        assert {:ok, _} = Store.set_driver_availability(server, "B", true)
+        assert {:ok, :processed} = Store.process_event(server, "redispatch-expired-" <> offer.id)
+        assert {:ok, _} = Store.accept_offer(server, ride.id, "B")
+        assert {:ok, _} = Store.complete_ride(server, ride.id)
+      else
+        assert {:ok, _} = Store.cancel_ride(server, ride.id)
+      end
 
+      input = :sys.get_state(server)
+      assert Store.expire_offer(server, offer.id) == {:ok, :already_expired}
+      assert :sys.get_state(server) == input
       broken = put_in(input.rides[ride.id].assignedDriverId, "A")
 
       assert {:reply, {:error, :inconsistent_ownership}, ^broken} =
                StateServer.handle_call({:expire_offer, offer.id}, nil, broken)
+
+      other = %{
+        input.rides[ride.id]
+        | id: "other",
+          status: :driver_assigned,
+          assignedDriverId: "A",
+          currentOfferId: offer.id
+      }
+
+      broken = put_in(input.rides["other"], other)
+
+      assert {:reply, {:error, :inconsistent_ownership}, ^broken} =
+               StateServer.handle_call({:expire_offer, offer.id}, nil, broken)
     end
-
-    other = %{
-      state.rides[ride.id]
-      | id: "other",
-        status: :driver_assigned,
-        assignedDriverId: "A",
-        currentOfferId: offer.id
-    }
-
-    input = put_in(state.rides["other"], other)
-
-    assert {:reply, {:error, :inconsistent_ownership}, ^input} =
-             StateServer.handle_call({:expire_offer, offer.id}, nil, input)
   end
 
   test "synthetic replacement status without valid current evidence cannot authorize historical replay" do
