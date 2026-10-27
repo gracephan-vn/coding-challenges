@@ -277,6 +277,26 @@ defmodule RideDispatch.Dispatch.TerminalLifecycleTest do
              StateServer.handle_call({:terminal_ride, :cancel, ride.id}, nil, broken)
   end
 
+  test "discarded terminal responses replay immutable proof without reading a new clock" do
+    for operation <- [:cancel, :complete] do
+      {server, ride, _, clock} = reserved()
+      assert {:ok, _} = Store.accept_offer(server, ride.id, "A")
+
+      task =
+        Task.async(fn ->
+          assert {:ok, _} = apply(Store, terminal_command(operation), [server, ride.id])
+          :response_lost
+        end)
+
+      assert Task.await(task) == :response_lost
+      before = :sys.get_state(server)
+      original = before.rides[ride.id].terminal_receipt.original_result
+      :atomics.put(clock, 1, -999_999)
+      assert apply(Store, terminal_command(operation), [server, ride.id]) == {:ok, original}
+      assert :sys.get_state(server) == before
+    end
+  end
+
   defp terminal_command(:cancel), do: :cancel_ride
   defp terminal_command(:complete), do: :complete_ride
 end
