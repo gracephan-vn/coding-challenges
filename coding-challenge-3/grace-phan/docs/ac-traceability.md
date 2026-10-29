@@ -33,7 +33,7 @@ Module names below are under `RideDispatch`; controller names are under
 
 | AC | Required behavior | Implemented modules/functions/routes | Relevant automated tests | Status | Remaining work |
 |---|---|---|---|---|---|
-| AC-01 | Create/retrieve a unique REQUESTED ride; validate passenger and coordinates; require idempotency key, replay original result, reject changed payload | `Rides.create_ride/3`, `Rides.get_ride/2`, `Rides.Request.normalize/1`, `Store.create_ride/3`, `Store.get_ride/2`; atomic StateServer callback; seeded P001; `POST /rides`, `GET /rides/:rideId` | Request tests (3), Ride Store tests (7), Ride HTTP tests (9): coordinates/boundaries, strict fields, passenger validation, unique IDs, retrieval, 201 replay, conflicts and competing duplicates; Feature #9 checkpoint full suite 116 passed (current full suite: Feature #14 below) | VERIFIED | Creation contract verified; Feature #10A HTTP test also verifies original POST replay after the real asynchronous MATCHING transition |
+| AC-01 | Create/retrieve a unique REQUESTED ride; validate passenger and coordinates; require idempotency key, replay original result, reject changed payload | `Rides.create_ride/3`, `Rides.get_ride/2`, `Rides.Request.normalize/1`, `Store.create_ride/3`, `Store.get_ride/2`; atomic StateServer callback; seeded P001; `POST /rides`, `GET /rides/:rideId` | Request tests (3), Ride Store tests (7), Ride HTTP tests (9): coordinates/boundaries, strict fields, passenger validation, unique IDs, retrieval, 201 replay, conflicts and competing duplicates; Feature #9 checkpoint full suite 116 passed (later historical checkpoints below) | VERIFIED | Creation contract verified; Feature #10A HTTP test also verifies original POST replay after the real asynchronous MATCHING transition |
 | AC-02 | Availability API, OFFERED/BUSY rules, coordinated rejection/cancellation/completion release; reject all other transitions | Driver State Machine; Store availability/reservation/acceptance/rejection/expiration/cancel/complete; Driver and Ride HTTP routes | Existing state/Driver HTTP suites plus live pending/accepted cancellation, completion, Driver reuse and ten terminal race groups; full suite 310 passed | VERIFIED | Specified clauses supported; availability API is distinct from internal lifecycle actions. No caller authentication or durability claim |
 | AC-03 | Update valid coordinates, reject invalid ones, store and match using latest location | Location, Store.update_driver_location/3, PUT /drivers/:id/location; StateServer passes current Driver records to Matcher | Location/Store/Driver HTTP tests plus reservation latest-location test and Ride HTTP integration prove an update changes selected Driver | VERIFIED | No remaining specified clause; stale-update timestamp detection is not implemented or required |
 | AC-04 | Ride-triggered nearest AVAILABLE matching; default/configurable 2 km radius; distance ordering, outside/none/ties; valid coordinates | Location.distance_km/2, Matcher.nearest/3 (minimum `{distance, id}` ordering), Store.process_event/2; authoritative DispatchRequested handler | Pure Matcher/Haversine tests plus reservation default/custom/exact-boundary/just-outside/tie/no-candidate checks and actual asynchronous Ride creation → reservation | VERIFIED | No remaining specified clause; scans approximate spherical distance and no performance claim is made |
@@ -301,13 +301,14 @@ no caller authentication and lack of crash durability remain explicit limitation
   and [ADR-003](adr/ADR-003-event-processing.md) remain unchanged in #10B/#11/#12/#13. ADR-002's Phase B scope is historical. Single-mailbox
   contention, scans/sorting, volatile restart loss, single-owner/node limits,
   timeout uncertainty, and stale future ETS projections remain documented limits.
-- R2 resolves the local provisioning and lifecycle-observability submission gaps;
-  README includes an executable external HTTP demo. Architecture/sequence diagrams
-  and the full scaling explanation remain incomplete (F1/F6); broader README
-  presentation remains F7. Accepted ADRs do not complete those deliverables.
+- R2 supplies local provisioning and lifecycle observability with an executable
+  external HTTP demo. R3 adds the architecture/component view, six sequences,
+  scaling analysis and reviewer Quick Start; these documentation deliverables do
+  not add business behavior or independently re-audit the AC labels.
 - The guide's historical scalar Ride example is not the actual API or TDD history.
-  The implemented pure Ride State Machine accepts a map. Future lifecycle
-  signatures remain provisional; creation/query and event-processing APIs are implemented.
+  The implemented pure Ride State Machine accepts a map. Lifecycle Store/HTTP
+  APIs are implemented through Feature #14; historical proposed signatures are
+  not a substitute for current source contracts.
 
 ## Submission remediation R2 — demo and correlated observability
 
@@ -336,3 +337,46 @@ errors, format check and whitespace check passed.
 - Logs are best effort, not durable/exactly-once; crash windows, single-owner/node
   limits, volatile state, history growth and no caller authentication remain.
   R2 changes no specification, Accepted ADR, state machine or dependency lockfile.
+
+## Submission remediation R3 — documentation verification
+
+Documentation-only remediation at baseline `c7155123fe13bb72a5f94b37883b7ba2e2cbcc05`.
+No business AC status is promoted or re-audited; source, tests, configuration,
+lockfile, specification and Accepted ADRs remain unchanged.
+
+- F1: [architecture](architecture.md) documents actual module/process boundaries,
+  one-owner state, atomic commands, receipts, supervision, recovery and logging;
+  [six sequences](sequence-diagram.md) show creation/matching, acceptance,
+  rejection/rematching, expiration/rematching, terminal closure and competing Rides.
+- F6: architecture analysis distinguishes current scan/validation costs from
+  proposed 100k read/index/retention optimizations and 1m distributed coordination.
+  It identifies authoritative Driver reservation, transaction/outbox boundaries,
+  stale-projection handling and retry/recovery costs; no benchmarks are claimed.
+- F7: README Quick Start, actual runtime requirements, API table, troubleshooting
+  and links replace generator boilerplate. The complete R2 demo section is retained
+  byte-for-byte. Narrow guide corrections remove empty-document claims, nonexistent
+  context paths and implied command correlation fields, preserving historical counts.
+- R3 execution (2026-10-29): `mix deps.get` succeeded without lockfile changes;
+  `mix test` **321 passed**; compile warnings-as-errors, format check and
+  `git diff --check` passed. Elixir **1.20.4**, OTP **29.1.2**. This used the existing
+  development checkout, **not a fresh isolated checkout** or compatibility matrix.
+- Markdown parsed and relative links/anchors checked. The architecture diagram,
+  six sequence diagrams and corrected existing guide overview parsed/rendered with
+  Mermaid CLI **12.0.0** and installed Chrome; visual previews were reviewed.
+  Tooling/build images stayed in `/tmp`, with no project dependency added.
+- The README Python block ran against a real Phoenix listener on port 4000:
+  create 201 → D001 assignment → reject 200 → D002 assignment → accept 200 →
+  complete 200; D002 AVAILABLE via the existing availability command. Stale D001
+  acceptance returned 409; duplicate completion and creation replayed original
+  results. Captured logs linked `ride-1`, `event-1`, `dispatch-ride-1`, `offer-2`,
+  `redispatch-offer-2`, `offer-3` and D001/D002, with one completion success and
+  separate replay records. This is external HTTP evidence, not synthetic state.
+- **Remaining security finding:** `mix hex.audit` exited **1**, reporting locked
+  Bandit **1.14.0**, HIGH **EEF-CVE-2026-116078 / GHSA-pxjf-g536-7r93**.
+  The [maintainer advisory](https://github.com/mtrudel/bandit/security/advisories/GHSA-pxjf-g536-7r93)
+  (published 2026-10-28) covers versions `>= 0.3.1, < 1.14.1`, patched in **1.14.1**:
+  HTTP/2 body-frame memory amplification. Dependency remediation is outside R3;
+  the lockfile is preserved. No other advisory was reported by this invocation.
+
+R3 documentation completion is not overall submission readiness. The new security
+finding needs a separately authorized dependency correction and regression check.
