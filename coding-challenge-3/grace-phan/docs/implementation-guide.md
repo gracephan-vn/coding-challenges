@@ -35,13 +35,14 @@ Hiện tại: `DriverController → Dispatch.Store → Dispatch.StateServer`; Ri
 
 ```mermaid
 flowchart TD
-  API[Phoenix REST API] --> APP[Rides / Drivers / Dispatch context APIs]
+  API[Phoenix REST API] --> APP[Rides context]
   APP --> PORT[Dispatch.Store - stable read/command API]
+  API -->|DriverController| PORT
   PORT --> STORE[StateServer - GenServer]
   STORE --> CORE[Pure domain core: matching / transitions / validation]
   STORE --> STATE[Maps: rides / drivers / offers / idempotency / events]
   PUMP[Supervised EventDispatcher] -->|discovery / atomic process_event| PORT
-  TIMER[Supervised timeout scheduler] -->|ExpireOffer command| APP
+  TIMER[Supervised ExpirationScheduler] -->|expire_offer command| PORT
 ```
 
 **IMPLEMENTED:** `CreateRide` tạo Ride, idempotency record và pending `RideCreated` trong cùng một lần đổi state. **IMPLEMENTED 10A:** EventDispatcher tiêu thụ RideCreated bất đồng bộ qua Store. **IMPLEMENTED 10B:** DispatchRequested consumption, nearest matching và pending Offer reservation; POST chỉ tạo pending work.
@@ -370,7 +371,7 @@ Definite worker exceptions/retryable results được ghi bằng `fail_event(ser
 
 Timeout là uncertain: reread authoritative record trước retry, không ghi definite failure vì timeout. Dispatcher crash trước commit để lại pending work; crash sau commit không lặp transition hoặc successor. Dispatcher monitor owner và reconnect registered name sau restart; owner crash làm mất toàn bộ RAM. Không claim durable/exactly-once delivery. Production dispatcher gọi Store; optional worker processing function ở dispatcher chỉ là fault-injection seam, không phải mutation callback của owner.
 
-AC-10 VERIFIED theo flow Ride Created → async Dispatch Event → matching cùng README giải thích async/duplicates/failure. Điều này không hoàn tất AC-05 lifecycle; AC-09 có acceptance concurrency evidence riêng từ Feature #11. ADR-001/002/003 giữ nguyên quyết định Accepted; mô tả scope 10A là lịch sử. Trade-offs: một mailbox, O(n) Driver scan, thêm Ride/Offer/history scans, retained memory và volatile single-node state; chưa có benchmark.
+AC-10 VERIFIED theo flow Ride Created → async Dispatch Event → matching cùng README giải thích async/duplicates/failure. Riêng evidence #10A/#10B không hoàn tất AC-05 lifecycle; các Feature #11–#14 bổ sung lifecycle evidence, và AC-09 có acceptance concurrency evidence riêng từ Feature #11. ADR-001/002/003 giữ nguyên quyết định Accepted; mô tả scope 10A là lịch sử. Trade-offs: một mailbox, O(n) Driver scan, thêm Ride/Offer/history scans, retained memory và volatile single-node state; chưa có benchmark.
 
 ### G2. Timeout và đồng hồ giả lập
 
@@ -509,28 +510,21 @@ feat(dispatch): single-owner atomic assignment - GREEN
 refactor(dispatch): isolate pure domain reducer
 ```
 
-**VERIFIED Feature #14:** **42 focused passed** (16 terminal Store/receipt/reuse, 10 ordered/barrier concurrency, 5 worker integration, 11 HTTP); full `mix test` **310 passed**. Compile warnings-as-errors, format và diff checks passed. Các historical counts #9–#13 giữ nguyên; đây là current lifecycle evidence. AC-02/05/06 được đối chiếu từng clause tại traceability, không promote chỉ từ HTTP test count. Các AC đã VERIFIED khác có full regression evidence. Independent submission audit chưa bắt đầu.
+**VERIFIED Feature #14:** **42 focused passed** (16 terminal Store/receipt/reuse, 10 ordered/barrier concurrency, 5 worker integration, 11 HTTP); full `mix test` **310 passed**. Compile warnings-as-errors, format và diff checks passed. Các historical counts #9–#13 giữ nguyên; đây là evidence tại checkpoint Feature #14, không phải số test hiện tại. AC-02/05/06 được đối chiếu từng clause tại traceability, không promote chỉ từ HTTP test count. Các AC đã VERIFIED khác có full regression evidence. Independent audit và remediation R1/R2 diễn ra sau checkpoint này; xem traceability.
 
 ## J. Documentation bắt buộc & Scaling
 
-Danh sách dưới đây là deliverables mục tiêu. Hiện `README.md` đã mô tả Ride creation/retrieval, idempotency và volatile-state limitations, nhưng chưa đủ toàn bộ deliverables; `docs/architecture.md` và `docs/sequence-diagram.md` là file rỗng. Ba ADR đã Accepted; không suy ra architecture/sequence deliverables hoàn tất từ sự tồn tại của file. Các khoảng trống này vẫn **PLANNED**.
+**Implemented documentation (R3):** [README](../README.md) có Quick Start,
+API contracts, opt-in demo và limitations. [Architecture](architecture.md) có
+component diagram, actual modules/processes, state ownership, receipts, failure
+boundaries và scaling analysis. [Sequence diagrams](sequence-diagram.md) có sáu
+lifecycle/concurrency sequences. Accepted ADRs giữ nguyên quyết định và historical
+feature context; không suy ra trạng thái hiện tại từ các planned notes cũ.
 
-```text
-coding-challenge-3/my-team/
-├── README.md
-├── lib/ride_dispatch/{rides,drivers,dispatch,storage,messaging}/...
-├── lib/ride_dispatch_web/{router.ex,controllers}/...
-├── test/...
-└── docs/
-    ├── architecture.md
-    ├── sequence-diagram.md
-    └── adr/
-        ├── ADR-001-matching.md
-        ├── ADR-002-concurrency.md
-        └── ADR-003-event-processing.md
-```
-
-**README:** prerequisites, setup, `mix deps.get`, `mix test`, `mix phx.server`, seed strategy, 8 API endpoints, curl examples, how to reproduce concurrency test, idempotency, asynchronous semantics and failure handling, known limitations, AI tools usage.
+Actual source boundaries: `lib/ride_dispatch/{rides,drivers,dispatch}` cùng
+`location.ex`, `demo.ex`, `application.ex`; HTTP ở `lib/ride_dispatch_web`.
+Không có `storage`/`messaging` subsystem riêng. README liệt kê đủ 8 routes,
+configuration, commands và external demo; không có HTML homepage hay Offer-query API.
 
 **ADR-001:** Haversine + radius 2 km + deterministic tie break vs geographic index/road ETA; O(n) candidate scan and evolution to PostGIS/geo-partition.
 
@@ -544,9 +538,9 @@ coding-challenge-3/my-team/
 | 100,000 drivers | One GenServer mailbox và scan toàn bộ | Đo read contention; cân nhắc ETS `:protected` read projection, spatial index và partition theo địa lý nếu cần; nhiều dispatch workers |
 | 1,000,000 drivers | Routing/consistency xuyên nodes, durable event throughput | Shared durable store, broker, partitioning và observability đầy đủ |
 
-Nêu ít nhất **3 bottlenecks, 3 strategies, 2 trade-offs**; không tuyên bố hệ thống đã hỗ trợ 1 triệu tài xế nếu chưa benchmark.
+Phân tích chi tiết **3+ bottlenecks, 3 strategies, 2+ trade-offs** nằm tại [Architecture — Scalability](architecture.md#scalability-and-performance-design). Bảng trên là roadmap, không phải triển khai: nhiều workers hoặc partition theo Ride/geography không tự bảo đảm Driver exclusivity. Đề xuất distributed design cần authoritative Driver reservation, atomic Ride/Driver/Offer coordination và durable outbox. Không có benchmark hay tuyên bố đã hỗ trợ 1 triệu tài xế.
 
-Logs có `rideId`, `driverId`, `eventId` để trả lời *“What happened to ride R001?”*. Đối với command không phát event, dùng thêm `requestId` hoặc `commandId` để dễ trace.
+Logs hiện có `rideId`, `driverId`, `eventId`, `offerId`, `outcome` khi có identity thực để trả lời *“What happened to ride R001?”*. `causedByEventId` nối causal events. Không giả định mỗi command có `requestId`/`commandId` hoặc event mới; post-installation Logger là best effort, không phải durable audit trail.
 
 ## K. Definition of Done và nộp bài
 
