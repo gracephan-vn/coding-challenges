@@ -12,8 +12,8 @@ defmodule RideDispatch.Rides.StateMachine do
   and cannot identify stale duplicates when a later state permits the action.
 
   No Driver, Offer, or stored Ride is changed. Offer identity, ownership,
-  deadlines, matching, reservation, and idempotency belong to future atomic
-  Store commands. Those commands must also persist transitions, clear
+  deadlines, matching, reservation, and idempotency belong to atomic Store
+  commands implemented by StateServer. Those commands persist transitions, clear
   `assignedDriverId` on rejection/timeout, and coordinate Driver release.
   This function intentionally preserves assignment fields even on rejection.
   """

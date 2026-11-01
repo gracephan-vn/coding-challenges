@@ -14,8 +14,8 @@ defmodule RideDispatch.Drivers.StateMachine do
 
   Actions describe intent, not caller authorization. This module does not check
   offer identity, deadlines, ride ownership, coordinates, or idempotency records,
-  and it does not reserve a driver. Future atomic Store commands must enforce
-  those checks, coordinate related records, and handle duplicate commands safely.
+  and it does not reserve a driver. Atomic Store commands implemented by StateServer
+  enforce those checks, coordinate related records, and handle duplicate commands safely.
   """
 
   @transitions %{

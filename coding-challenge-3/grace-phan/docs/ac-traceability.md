@@ -380,3 +380,10 @@ lockfile, specification and Accepted ADRs remain unchanged.
 
 R3 documentation completion is not overall submission readiness. The new security
 finding needs a separately authorized dependency correction and regression check.
+
+**Subsequent R3.1 closure (2026-11-01):** commit `ebb4b94` upgraded Bandit from
+1.14.0 to **1.14.1**. The previously verified post-remediation `mix hex.audit`
+completed successfully. The historical R3 finding above is therefore **closed**;
+its original result remains preserved as evidence of the earlier lockfile.
+That audit result applies to the advisory data available at verification time,
+not a guarantee against future vulnerabilities.
