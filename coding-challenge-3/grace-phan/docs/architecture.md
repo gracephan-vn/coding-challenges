@@ -317,6 +317,36 @@ and tests before migration; it is **not another implemented or proven strategy**
 Regional failover likewise requires fencing the old writer before a new one can
 reserve. Avoid global writes during a partition if exclusivity cannot be proved.
 
+#### Proposed broker scaling and recovery
+
+This future design would replace the current in-memory EventDispatcher delivery
+mechanism with a durable broker. Partition events by `rideId` when per-Ride
+ordering is needed. Preserve the Ride's committed event sequence through outbox
+publication and sequential processing within its partition; broker ordering alone
+does not reconstruct causal order across multiple publishers. Ordering applies
+within a partition, not across partitions. In a consumer group, one active
+consumer owns each partition, so partition count limits parallelism; hot Rides
+can still bottleneck a partition. Additional groups receive independent deliveries
+and must not become independent reservation authorities.
+
+Monitor consumer lag, oldest unprocessed event age, outbox backlog and processing
+failures. Scale consumers within the partition limit, but throttle intake or pause
+consumption when the authoritative store is overloaded. Bound in-flight work and
+retries, retain failed events for controlled recovery, and drain backlog after
+capacity returns rather than discard committed work. Rebalancing and crashes can
+redeliver unacknowledged events: commit business effects and input deduplication
+together before acknowledging. Retry with stable event/operation identities and
+validate current Offer/version evidence. The durable outbox publisher resumes
+unpublished entries after failure; a lost publish acknowledgement can cause a
+duplicate, which consumers must handle idempotently.
+
+Two consumers handling different Rides can both select D001 regardless of broker
+ordering. Both must use the shared transactional or conditional-update authority
+described above: D001's ownership constraint arbitrates reservation, with the
+Ride/Driver/Offer/receipt/outbox changes committed together. Consumer assignment
+and partition keys grant no Driver ownership. These are proposed mechanisms with
+new operational costs, not implemented distributed guarantees or measured capacity.
+
 ### Trade-offs and migration gates
 
 - **Serialization versus coordination:** one owner makes correctness inspectable;

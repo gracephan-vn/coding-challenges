@@ -36,10 +36,10 @@ terminal. Demo state is volatile and recreated from seeds after restart.
   The project does not pin an OTP minimum or claim a tested version matrix.
 - Hex for dependency resolution (`mix local.hex` if not installed). Phoenix is a
   locked project dependency; no global Phoenix generator is needed. `mix.lock`
-  retains Phoenix 1.8.16 and the historical R1 Bandit 1.14.0 upgrade.
-  **R3 security check:** that Bandit version now has a HIGH advisory; see the
-  [verification record](docs/ac-traceability.md#submission-remediation-r3--documentation-verification).
-  R3 does not change dependencies or claim a clean security audit.
+  locks Phoenix 1.8.16 and Bandit **1.14.1**, updated from 1.14.0 by the R3.1
+  security hotfix. The earlier R1 upgrade to 1.14.0 and
+  [R3 security verification record](docs/ac-traceability.md#submission-remediation-r3--documentation-verification)
+  describe the historical lockfile before R3.1.
 - Python 3 only for the copy/paste HTTP demo below. No Node toolchain, database,
   Docker service, broker or local secret is required for development/tests.
 
